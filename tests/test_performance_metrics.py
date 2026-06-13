@@ -1,8 +1,55 @@
 import math
 
+import numpy as np
 import pandas as pd
 
-from scripts.performance_metrics import drawdown_curve, max_drawdown
+from scripts.performance_metrics import (
+    annualized_volatility,
+    drawdown_curve,
+    max_drawdown,
+    sharpe_ratio,
+)
+
+
+def test_annualized_volatility_scales_sample_return_std_by_square_root_of_periods():
+    returns = pd.Series([0.01, -0.02, 0.03, 0.00])
+
+    result = annualized_volatility(returns, periods_per_year=252)
+
+    expected = returns.std(ddof=1) * math.sqrt(252)
+    assert math.isclose(result, expected, rel_tol=0, abs_tol=1e-12)
+
+
+def test_annualized_volatility_ignores_missing_returns():
+    returns = pd.Series([0.01, None, -0.02, 0.03, None, 0.00])
+
+    result = annualized_volatility(returns, periods_per_year=252)
+
+    expected = pd.Series([0.01, -0.02, 0.03, 0.00]).std(ddof=1) * math.sqrt(252)
+    assert math.isclose(result, expected, rel_tol=0, abs_tol=1e-12)
+
+
+def test_sharpe_ratio_annualizes_excess_return_over_risk_free_rate():
+    returns = pd.Series([0.01, -0.02, 0.03, 0.00])
+    annual_risk_free_rate = 0.03
+    periods_per_year = 252
+
+    result = sharpe_ratio(
+        returns,
+        periods_per_year=periods_per_year,
+        annual_risk_free_rate=annual_risk_free_rate,
+    )
+
+    period_rf = (1 + annual_risk_free_rate) ** (1 / periods_per_year) - 1
+    excess_returns = returns - period_rf
+    expected = excess_returns.mean() / excess_returns.std(ddof=1) * math.sqrt(periods_per_year)
+    assert math.isclose(result, expected, rel_tol=0, abs_tol=1e-12)
+
+
+def test_sharpe_ratio_returns_nan_when_volatility_is_zero():
+    result = sharpe_ratio(pd.Series([0.01, 0.01, 0.01]), periods_per_year=252)
+
+    assert np.isnan(result)
 
 
 def test_drawdown_curve_uses_running_peak_and_preserves_index():

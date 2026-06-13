@@ -9,7 +9,12 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.performance_metrics import drawdown_curve, max_drawdown
+from scripts.performance_metrics import (
+    annualized_volatility,
+    drawdown_curve,
+    max_drawdown,
+    sharpe_ratio,
+)
 
 DATA_PATH = PROJECT_ROOT / "data" / "sample_etf_daily_long.csv"
 df = pd.read_csv(DATA_PATH)
@@ -40,6 +45,10 @@ df["strategy_equity"] = (1 + df["strategy_ret"]).cumprod()
 df["benchmark_equity"] = (1 + df["benchmark_ret"]).cumprod()
 df["strategy_drawdown"] = drawdown_curve(df["strategy_equity"])
 df["benchmark_drawdown"] = drawdown_curve(df["benchmark_equity"])
+strategy_annual_vol = annualized_volatility(df["strategy_ret"], periods_per_year=252)
+benchmark_annual_vol = annualized_volatility(df["benchmark_ret"], periods_per_year=252)
+strategy_sharpe = sharpe_ratio(df["strategy_ret"], periods_per_year=252)
+benchmark_sharpe = sharpe_ratio(df["benchmark_ret"], periods_per_year=252)
 assert df["position"].equals(df["signal"].shift(1).fillna(False).astype(bool))
 assert df["strategy_equity"].notna().all()
 assert df["benchmark_equity"].notna().all()
@@ -53,4 +62,8 @@ print("strategy_equity_last", round(float(df["strategy_equity"].iloc[-1]), 6))
 print("benchmark_equity_last", round(float(df["benchmark_equity"].iloc[-1]), 6))
 print("strategy_max_drawdown", round(float(max_drawdown(df["strategy_equity"])), 6))
 print("benchmark_max_drawdown", round(float(max_drawdown(df["benchmark_equity"])), 6))
+print("strategy_annual_volatility", round(float(strategy_annual_vol), 6))
+print("benchmark_annual_volatility", round(float(benchmark_annual_vol), 6))
+print("strategy_sharpe", round(float(strategy_sharpe), 6))
+print("benchmark_sharpe", round(float(benchmark_sharpe), 6))
 print("strategy_drawdown_last", round(float(df["strategy_drawdown"].iloc[-1]), 6))
