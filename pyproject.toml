@@ -10,3 +10,8 @@ dependencies = [
     "openpyxl",
     "pandas",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.0",
+]
