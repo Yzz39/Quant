@@ -61,7 +61,14 @@ cells = [
         3. 若最佳行业 ETF 动量为正，持有它；
         4. 若最佳行业 ETF 动量为负或不可用，转向防守资产；
         5. 若最佳防守资产动量也不为正，则空仓；
-        6. 每次换仓扣 `0.02%` 简化成本。
+        6. 每次换仓扣 `0.02%` 简化成本；
+        7. 统计单边换手、双边成交、订单数与成本拖累。
+
+        换手口径：
+
+        - `one_way_turnover`：组合资金被替换的比例。`ETF A -> ETF B` 记 `100%`，`ETF -> CASH` 记 `100%`，`CASH -> ETF` 记 `100%`。
+        - `two_way_traded`：实际买卖成交规模。`ETF A -> ETF B` 记 `200%`，`ETF -> CASH` 或 `CASH -> ETF` 记 `100%`。
+        - `order_count`：估算订单笔数。`ETF A -> ETF B` 记 `2`，`ETF -> CASH` 或 `CASH -> ETF` 记 `1`。
         """
     ),
     code(
@@ -241,11 +248,26 @@ cells = [
                 mask = positions.eq(symbol)
                 strategy_ret.loc[mask] = daily_ret.loc[mask, symbol]
 
-            trades = positions.ne(positions.shift(1)).fillna(False)
+            previous_positions = positions.shift(1).fillna("CASH")
+            trades = positions.ne(previous_positions).fillna(False)
             trades.iloc[0] = False
+            previous_is_cash = previous_positions.eq("CASH")
+            current_is_cash = positions.eq("CASH")
+            one_way_turnover = trades.astype(float)
+            two_way_traded = pd.Series(0.0, index=close.index, name="two_way_traded")
+            two_way_traded.loc[trades & ~previous_is_cash & ~current_is_cash] = 2.0
+            two_way_traded.loc[trades & (previous_is_cash | current_is_cash)] = 1.0
+            order_count = pd.Series(0, index=close.index, name="order_count")
+            order_count.loc[trades & ~previous_is_cash & ~current_is_cash] = 2
+            order_count.loc[trades & (previous_is_cash | current_is_cash)] = 1
+            estimated_cost = two_way_traded * FEE_RATE
+
             strategy_ret_after_cost = strategy_ret.copy()
-            strategy_ret_after_cost.loc[trades] -= FEE_RATE
+            strategy_ret_after_cost -= estimated_cost
+            nav_before_cost = (1.0 + strategy_ret).cumprod()
             nav = (1.0 + strategy_ret_after_cost).cumprod()
+            cost_drag = nav_before_cost.iloc[-1] / nav.iloc[-1] - 1.0
+            years = len(close.index) / 252
 
             daily = pd.DataFrame(
                 {
@@ -253,10 +275,16 @@ cells = [
                     "window_label": label,
                     "lookback_days": lookback_days,
                     "rebalance_frequency": frequency,
+                    "previous_position": previous_positions.values,
                     "position": positions.values,
                     "strategy_return": strategy_ret.values,
                     "strategy_return_after_cost": strategy_ret_after_cost.values,
                     "trade": trades.values,
+                    "one_way_turnover": one_way_turnover.values,
+                    "two_way_traded": two_way_traded.values,
+                    "order_count": order_count.values,
+                    "estimated_cost": estimated_cost.values,
+                    "nav_before_cost": nav_before_cost.values,
                     "nav": nav.values,
                 }
             )
@@ -271,10 +299,19 @@ cells = [
                 "max_drawdown": max_drawdown(nav),
                 "sharpe_like_no_rf": sharpe_like(strategy_ret_after_cost),
                 "trade_count": int(trades.sum()),
+                "order_count": int(order_count.sum()),
+                "total_one_way_turnover": float(one_way_turnover.sum()),
+                "annual_one_way_turnover": float(one_way_turnover.sum() / years),
+                "total_two_way_traded": float(two_way_traded.sum()),
+                "annual_two_way_traded": float(two_way_traded.sum() / years),
+                "total_estimated_cost": float(estimated_cost.sum()),
+                "annual_estimated_cost": float(estimated_cost.sum() / years),
+                "cost_drag": float(cost_drag),
                 "cash_days": int(positions.eq("CASH").sum()),
                 "defensive_days": int(positions.isin(defensive_symbols).sum()),
                 "sector_days": int(positions.isin(sector_symbols).sum()),
                 "final_nav": float(nav.iloc[-1]),
+                "final_nav_before_cost": float(nav_before_cost.iloc[-1]),
                 "signal_count": len(decisions),
             }
             return daily, decisions, metrics
@@ -312,10 +349,19 @@ cells = [
                     "max_drawdown": max_drawdown(benchmark_nav),
                     "sharpe_like_no_rf": sharpe_like(daily_ret[benchmark_symbol]),
                     "trade_count": 0,
+                    "order_count": 0,
+                    "total_one_way_turnover": 0.0,
+                    "annual_one_way_turnover": 0.0,
+                    "total_two_way_traded": 0.0,
+                    "annual_two_way_traded": 0.0,
+                    "total_estimated_cost": 0.0,
+                    "annual_estimated_cost": 0.0,
+                    "cost_drag": 0.0,
                     "cash_days": 0,
                     "defensive_days": 0,
                     "sector_days": len(benchmark_nav),
                     "final_nav": float(benchmark_nav.iloc[-1]),
+                    "final_nav_before_cost": float(benchmark_nav.iloc[-1]),
                     "signal_count": 0,
                 }
             ]
@@ -334,6 +380,13 @@ cells = [
             "max_drawdown",
             "sharpe_like_no_rf",
             "trade_count",
+            "order_count",
+            "total_one_way_turnover",
+            "annual_one_way_turnover",
+            "total_two_way_traded",
+            "annual_two_way_traded",
+            "total_estimated_cost",
+            "cost_drag",
             "signal_count",
             "cash_days",
             "defensive_days",
@@ -364,6 +417,10 @@ cells = [
                 avg_max_drawdown=("max_drawdown", "mean"),
                 avg_sharpe_like=("sharpe_like_no_rf", "mean"),
                 avg_trade_count=("trade_count", "mean"),
+                avg_order_count=("order_count", "mean"),
+                avg_annual_one_way_turnover=("annual_one_way_turnover", "mean"),
+                avg_annual_two_way_traded=("annual_two_way_traded", "mean"),
+                avg_cost_drag=("cost_drag", "mean"),
                 best_annualized_return=("annualized_return", "max"),
                 worst_annualized_return=("annualized_return", "min"),
             )
