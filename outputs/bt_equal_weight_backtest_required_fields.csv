@@ -1,0 +1,7 @@
+﻿field,level,meaning,type,example,rule
+date,必需,交易日期,date,2015-01-05,必须可解析为日期；同一symbol内升序；用于生成调仓日和价格索引
+symbol,必需,证券/ETF代码,string,512880,必须保留前导0；同一ETF全程一致；不可混用交易所后缀口径
+close,必需,收盘价/复权收盘价,float,1.234,必须为正数；当前项目使用前复权qfq；vectorbt用它成交和计算收益
+name,必需,ETF名称,string,证券ETF,用于输出信号和报告；不参与计算但脚本会聚合读取
+bucket,必需,资产分类,category,sector/defensive/benchmark,sector参与行业主题排名；defensive作防守资产；benchmark作对照基准
+theme,必需,主题/行业标签,string,证券,用于报告解释和检查集中度；脚本会读取
