@@ -1,0 +1,3 @@
+﻿top_n,checked_recent_signals,same_day_selected_weight_count,next_day_match_count,fee_rate,slippage,one_way_cost_assumption,round_trip_cost_assumption,orders,total_order_value,total_fees_from_orders,implied_fee_rate_from_orders,annual_traded_value_ratio,total_return,max_drawdown
+2,59,40,59,0.0001,0.0001,0.0002,0.0004,4155,52157961.99934745,5215.79619993469,9.999999999999895e-05,47.22891276980077,7.069698924361342,-0.4605813684692449
+3,59,47,59,0.0001,0.0001,0.0002,0.0004,5686,33786973.059604526,3378.6973059602974,9.999999999999541e-05,30.59402519231168,2.7686481059547874,-0.4978623970141017
