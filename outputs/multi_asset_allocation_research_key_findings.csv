@@ -1,0 +1,7 @@
+﻿topic,finding,evidence_file,action
+核心基准,42日月度Top2等权明显跑赢510300买入持有，但最大回撤仍接近46%，不能称为低回撤策略。,bt_equal_weight_return_risk_evaluation_summary.csv / etf_topn_rotation_vectorbt_metrics.csv,继续研究Top2，但必须加入样本外、成本、纸面交易和风控观察。
+TopN差异,Top2在收益和回撤之间优于Top3；Top3分散更多但收益下降，回撤改善不明显。,etf_topn_rotation_vectorbt_metrics.csv,优先把Top2作为候选基线，Top3作为保守对照，不急于扩到更多资产。
+窗口稳定性,全样本最亮眼的短窗口在样本外退化明显；OOS排名显示Top1 6m、Top2 9m、Top2 2m值得继续比较。,etf_momentum_windows_topn_oos_ranking.csv,不要只用全样本最优参数；下一步做滚动/走前验证。
+调仓频率,双周平均年化略高但换手更高；月度收益接近且操作负担更低；季度换手低但收益明显下降。,etf_momentum_rebalance_frequency_summary.csv,现阶段优先保留月度调仓，双周只作为对照，不直接进入纸面交易。
+成本压力,基础成本影响较小，但在高成本和极端成本下年化收益明显下滑，说明策略对换手成本并非免疫。,etf_rotation_cost_stress_summary.csv,纸面交易记录真实成交价差，后续加入最小佣金和实际成交约束。
+未来函数与执行时序,现有检查显示最近信号均能在下一交易日匹配目标权重，但存在同日权重非零现象，需要用'信号日收盘后、次日执行'口径解释。,bt_equal_weight_future_leakage_cost_check_summary.csv,继续在新脚本和报告中显式标注信号日、执行日、持仓生效日。
