@@ -1,0 +1,4 @@
+# Local credentials and generated crawl data.
+cookie.txt
+*.jsonl
+data/
