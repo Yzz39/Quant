@@ -1,11 +1,14 @@
 # Step 04 M001: the preregistered ETF relative-momentum baseline.
 # Paste this file into JoinQuant. M0 uses RUN_MODE='momentum'; M1 uses
-# RUN_MODE='m1_absolute'; M2 uses RUN_MODE='m2_recent_confirm'.
+# RUN_MODE='m1_absolute'; M2 uses RUN_MODE='m2_recent_confirm';
+# M3A uses RUN_MODE='m3_ols_slope'; M3B uses RUN_MODE='m3b_efficiency'.
 from jqdata import *
 import datetime
+import math
 
 
-RUN_MODE = "m2_recent_confirm"
+RUN_MODE = "m3b_efficiency"
+CODE_VERSION = "m3b_efficiency_v0.1"
 CASH_SECURITY = "511880.XSHG"
 
 CORE = ["510300.XSHG", "511010.XSHG", "518880.XSHG", "511880.XSHG"]
@@ -27,9 +30,16 @@ DATA_FIELDS = ["open", "high", "low", "close", "volume", "money"]
 
 
 def initialize(context):
-    if RUN_MODE not in ("momentum", "m1_absolute", "m2_recent_confirm", "equal_weight"):
+    if RUN_MODE not in (
+        "momentum",
+        "m1_absolute",
+        "m2_recent_confirm",
+        "m3_ols_slope",
+        "m3b_efficiency",
+        "equal_weight",
+    ):
         raise ValueError(
-            "RUN_MODE must be momentum, m1_absolute, m2_recent_confirm, or equal_weight"
+            "RUN_MODE must be momentum, m1_absolute, m2_recent_confirm, m3_ols_slope, m3b_efficiency, or equal_weight"
         )
 
     set_benchmark("000300.XSHG")
@@ -60,6 +70,10 @@ def initialize(context):
     g.signal_count = 0
 
     starting_cash = context.portfolio.starting_cash
+    log.info(
+        "S04_CODE_VERSION %s"
+        % CODE_VERSION
+    )
     log.info(
         "S04_CONFIG mode=%s capital=%.2f lookback=%d recent_lookback=%d label_horizon=%d "
         "label_min_net=%.4f label_max_mae=%.4f train_start=%s train_end=%s"
@@ -105,7 +119,17 @@ def _generate_signal(context, signal_date):
         log.info("S04_SIGNAL_SKIPPED date=%s reason=pending_order" % signal_date)
         return
 
-    eligible, scores, recent_scores, reasons, avg_money = _eligible_universe(signal_date)
+    (
+        eligible,
+        scores,
+        recent_scores,
+        reasons,
+        avg_money,
+        slope_scores,
+        r2_scores,
+        path_returns,
+        efficiency_ratios,
+    ) = _eligible_universe(signal_date)
     if not g.baseline_started:
         if len(eligible) < len(CORE):
             log.info(
@@ -119,16 +143,22 @@ def _generate_signal(context, signal_date):
     if not eligible:
         target = {}
         selected = None
-    elif g.mode in ("momentum", "m1_absolute", "m2_recent_confirm"):
+    elif g.mode in (
+        "momentum",
+        "m1_absolute",
+        "m2_recent_confirm",
+        "m3_ols_slope",
+        "m3b_efficiency",
+    ):
         ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
         selected = ranked[0][0]
         absolute_pass = scores[selected] > 0.0
         recent_score = recent_scores[selected]
         recent_pass = recent_score > 0.0
-        if g.mode == "m2_recent_confirm" and selected == CASH_SECURITY:
+        if g.mode in ("m2_recent_confirm", "m3_ols_slope", "m3b_efficiency") and selected == CASH_SECURITY:
             target = {CASH_SECURITY: 1.0}
             decision = "cash_top1"
-        elif g.mode == "m2_recent_confirm" and (not absolute_pass or not recent_pass):
+        elif g.mode in ("m2_recent_confirm", "m3_ols_slope", "m3b_efficiency") and (not absolute_pass or not recent_pass):
             if CASH_SECURITY in eligible:
                 target = {CASH_SECURITY: 1.0}
                 decision = "recent_filter" if absolute_pass else "cash_filter"
@@ -199,19 +229,23 @@ def _generate_signal(context, signal_date):
                 "security": security,
                 "score": scores[security],
                 "selected": int(
-                    g.mode in ("momentum", "m1_absolute", "m2_recent_confirm")
+                    g.mode in ("momentum", "m1_absolute", "m2_recent_confirm", "m3_ols_slope", "m3b_efficiency")
                     and security == selected
                     and target.get(security, 0.0) > 0.0
                 ),
                 "gap": (
                     gap
-                    if g.mode in ("momentum", "m1_absolute", "m2_recent_confirm")
+                    if g.mode in ("momentum", "m1_absolute", "m2_recent_confirm", "m3_ols_slope", "m3b_efficiency")
                     and security == selected
                     and target.get(security, 0.0) > 0.0
                     else None
                 ),
                 "recent_score": recent_scores[security],
                 "recent_pass": recent_scores[security] > 0.0,
+                "slope": slope_scores.get(security),
+                "r2": r2_scores.get(security),
+                "path_return": path_returns.get(security),
+                "efficiency_ratio": efficiency_ratios.get(security),
             }
         )
 
@@ -221,6 +255,7 @@ def _generate_signal(context, signal_date):
     g.pending = {
         "signal_date": signal_date,
         "target": target,
+        "target_amounts": None,
         "attempts": 0,
         "last_attempt": None,
     }
@@ -242,6 +277,10 @@ def _eligible_universe(signal_date):
     eligible = []
     scores = {}
     recent_scores = {}
+    slope_scores = {}
+    r2_scores = {}
+    path_returns = {}
+    efficiency_ratios = {}
     reasons = {}
     avg_money = {}
 
@@ -299,87 +338,241 @@ def _eligible_universe(signal_date):
             reasons[security] = "incomplete_127d_close"
             log.info("S04_ELIGIBILITY date=%s security=%s eligible=0 reason=%s" % (signal_date, security, reasons[security]))
             continue
-        start_price = float(prices["close"].iloc[0])
-        end_price = float(prices["close"].iloc[-1])
-        if start_price <= 0 or end_price <= 0:
-            reasons[security] = "non_positive_close"
+        close_values = [float(value) for value in prices["close"].tolist()]
+        invalid_indices = [
+            index
+            for index, value in enumerate(close_values)
+            if not math.isfinite(value) or value <= 0
+        ]
+        if invalid_indices:
+            reasons[security] = "invalid_close count=%s first_index=%s first_value=%s" % (
+                len(invalid_indices),
+                invalid_indices[0],
+                close_values[invalid_indices[0]],
+            )
             log.info("S04_ELIGIBILITY date=%s security=%s eligible=0 reason=%s" % (signal_date, security, reasons[security]))
             continue
 
+        start_price = close_values[0]
+        end_price = close_values[-1]
+
         score = end_price / start_price - 1.0
-        recent_start_price = float(prices["close"].iloc[-RECENT_LOOKBACK - 1])
+        slope = None
+        r2 = None
+        path_return = None
+        efficiency_ratio = None
+        if g.mode == "m3_ols_slope":
+            try:
+                slope, r2, score = _log_ols_slope_score(close_values)
+            except (ValueError, OverflowError) as error:
+                reasons[security] = "ols_error=%s" % error
+                log.info(
+                    "S04_ELIGIBILITY date=%s security=%s eligible=0 reason=%s"
+                    % (signal_date, security, reasons[security])
+                )
+                continue
+        elif g.mode == "m3b_efficiency":
+            try:
+                path_return, efficiency_ratio, score = _log_efficiency_score(close_values)
+            except (ValueError, OverflowError) as error:
+                reasons[security] = "efficiency_error=%s" % error
+                log.info(
+                    "S04_ELIGIBILITY date=%s security=%s eligible=0 reason=%s"
+                    % (signal_date, security, reasons[security])
+                )
+                continue
+        recent_start_price = close_values[-RECENT_LOOKBACK - 1]
         recent_score = end_price / recent_start_price - 1.0
         eligible.append(security)
         scores[security] = score
         recent_scores[security] = recent_score
+        if slope is not None:
+            slope_scores[security] = slope
+            r2_scores[security] = r2
+        if path_return is not None:
+            path_returns[security] = path_return
+            efficiency_ratios[security] = efficiency_ratio
         log.info(
             "S04_ELIGIBILITY date=%s security=%s eligible=1 query_type=%s avg_money=%.2f "
-            "score=%.8f recent_score=%.8f"
-            % (signal_date, security, query_type, money, score, recent_score)
+            "score=%.8f recent_score=%.8f slope=%s r2=%s path_return=%s efficiency_ratio=%s"
+            % (
+                signal_date,
+                security,
+                query_type,
+                money,
+                score,
+                recent_score,
+                "%.10f" % slope if slope is not None else "NA",
+                "%.8f" % r2 if r2 is not None else "NA",
+                "%.10f" % path_return if path_return is not None else "NA",
+                "%.8f" % efficiency_ratio if efficiency_ratio is not None else "NA",
+            )
         )
 
-    return sorted(eligible), scores, recent_scores, reasons, avg_money
+    return (
+        sorted(eligible),
+        scores,
+        recent_scores,
+        reasons,
+        avg_money,
+        slope_scores,
+        r2_scores,
+        path_returns,
+        efficiency_ratios,
+    )
+
+
+def _log_ols_slope_score(closes):
+    """Return (log-price OLS slope, R2, slope*R2) for a frozen price window."""
+    values = [float(value) for value in closes]
+    invalid_count = sum(
+        1 for value in values if not math.isfinite(value) or value <= 0
+    )
+    if len(values) < 2 or invalid_count:
+        raise ValueError(
+            "OLS requires at least 2 finite positive closes; n=%s invalid=%s"
+            % (len(values), invalid_count)
+        )
+    y = [math.log(value) for value in values]
+    n = len(y)
+    x_mean = (n - 1) / 2.0
+    y_mean = sum(y) / n
+    denom = sum((index - x_mean) ** 2 for index in range(n))
+    slope = sum((index - x_mean) * (value - y_mean) for index, value in enumerate(y)) / denom
+    intercept = y_mean - slope * x_mean
+    residual = sum((value - (intercept + slope * index)) ** 2 for index, value in enumerate(y))
+    total = sum((value - y_mean) ** 2 for value in y)
+    r2 = 1.0 - residual / total if total > 0 else 0.0
+    r2 = max(0.0, min(1.0, r2))
+    return slope, r2, slope * r2
+
+
+def _log_efficiency_score(closes):
+    """Return (log path return, efficiency ratio, return*efficiency)."""
+    values = [float(value) for value in closes]
+    invalid_count = sum(
+        1 for value in values if not math.isfinite(value) or value <= 0
+    )
+    if len(values) < 2 or invalid_count:
+        raise ValueError(
+            "efficiency requires at least 2 finite positive closes; n=%s invalid=%s"
+            % (len(values), invalid_count)
+        )
+    log_prices = [math.log(value) for value in values]
+    path_return = log_prices[-1] - log_prices[0]
+    path_length = sum(
+        abs(log_prices[index] - log_prices[index - 1])
+        for index in range(1, len(log_prices))
+    )
+    efficiency_ratio = abs(path_return) / path_length if path_length > 0 else 0.0
+    efficiency_ratio = max(0.0, min(1.0, efficiency_ratio))
+    return path_return, efficiency_ratio, path_return * efficiency_ratio
 
 
 def execute_sells(context):
     if not _pending_from_prior_day(context):
         return
-    target = g.pending["target"]
-    total_value = context.portfolio.total_value
     current_data = get_current_data()
+    if not _ensure_target_amounts(context, current_data):
+        return
+    target_amounts = g.pending["target_amounts"]
     for security, position in list(context.portfolio.positions.items()):
-        target_value = total_value * target.get(security, 0.0)
-        if position.value <= target_value + max(position.price, 0.001) * 100:
+        current_amount = int(position.total_amount)
+        target_amount = int(target_amounts.get(security, 0))
+        if target_amount == 0:
+            amount = current_amount
+        else:
+            amount = ((current_amount - target_amount) // 100) * 100
+        if amount <= 0:
             continue
         if not _can_trade(security, "sell", current_data):
-            log.info("S04_BLOCK date=%s side=sell security=%s" % (context.current_dt, security))
+            log.info(
+                "S04_BLOCK date=%s side=sell security=%s current=%s target=%s"
+                % (context.current_dt, security, target_amount, current_amount)
+            )
             continue
-        order = order_target_value(security, target_value)
+        if target_amount == 0:
+            submitted_order = order_target(security, 0)
+        else:
+            submitted_order = order(security, -amount)
         log.info(
-            "S04_ORDER date=%s signal_date=%s side=sell security=%s target=%.2f order=%s"
-            % (context.current_dt, g.pending["signal_date"], security, target_value, order)
+            "S04_ORDER date=%s signal_date=%s side=sell security=%s current=%s target=%s amount=%s order=%s"
+            % (
+                context.current_dt,
+                g.pending["signal_date"],
+                security,
+                current_amount,
+                target_amount,
+                amount,
+                submitted_order,
+            )
         )
 
 
 def execute_buys(context):
     if not _pending_from_prior_day(context):
         return
-    target = g.pending["target"]
     current_data = get_current_data()
-    for security, position in list(context.portfolio.positions.items()):
-        if security not in target and position.total_amount:
-            return
+    if not _ensure_target_amounts(context, current_data):
+        return
+    target_amounts = g.pending["target_amounts"]
+    if not _all_positions_at_target(context, allow_underweight=True):
+        return
 
-    total_value = context.portfolio.total_value
-    for security in sorted(target):
-        target_value = total_value * target[security]
-        current_value = context.portfolio.positions[security].value if security in context.portfolio.positions else 0.0
-        if current_value >= target_value - max(current_data[security].last_price, 0.001) * 100:
+    for security in sorted(target_amounts):
+        target_amount = int(target_amounts[security])
+        current_amount = (
+            int(context.portfolio.positions[security].total_amount)
+            if security in context.portfolio.positions
+            else 0
+        )
+        amount = ((target_amount - current_amount) // 100) * 100
+        if amount < 100:
             continue
         if not _can_trade(security, "buy", current_data):
-            log.info("S04_BLOCK date=%s side=buy security=%s" % (context.current_dt, security))
-            continue
-        safe_target_value = _safe_buy_target_value(
-            context,
-            current_value=current_value,
-            desired_value=target_value,
-        )
-        if safe_target_value <= current_value:
             log.info(
-                "S04_BLOCK date=%s side=buy security=%s reason=insufficient_cash_for_costs"
-                % (context.current_dt, security)
+                "S04_BLOCK date=%s side=buy security=%s current=%s target=%s"
+                % (context.current_dt, security, current_amount, target_amount)
             )
             continue
-        order = order_target_value(security, safe_target_value)
+        buy_amount = min(amount, _affordable_buy_amount(context, security, current_data))
+        if buy_amount < 100:
+            log.info(
+                "S04_TARGET_REVISED date=%s security=%s old_target=%s new_target=%s reason=cash_limit"
+                % (context.current_dt, security, target_amount, current_amount)
+            )
+            target_amounts[security] = current_amount
+            continue
+        if buy_amount < amount:
+            revised_target = current_amount + buy_amount
+            log.info(
+                "S04_TARGET_REVISED date=%s security=%s old_target=%s new_target=%s reason=cash_limit"
+                % (context.current_dt, security, target_amount, revised_target)
+            )
+            target_amounts[security] = revised_target
+        submitted_order = order(security, buy_amount)
         log.info(
-            "S04_ORDER date=%s signal_date=%s side=buy security=%s target=%.2f safe_target=%.2f order=%s"
-            % (context.current_dt, g.pending["signal_date"], security, target_value, safe_target_value, order)
+            "S04_ORDER date=%s signal_date=%s side=buy security=%s current=%s target=%s amount=%s order=%s"
+            % (
+                context.current_dt,
+                g.pending["signal_date"],
+                security,
+                current_amount,
+                target_amount,
+                buy_amount,
+                submitted_order,
+            )
         )
 
     if _pending_satisfied(context):
         log.info(
             "S04_EXECUTION_COMPLETE date=%s signal_date=%s attempts=%s target=%s"
-            % (context.current_dt, g.pending["signal_date"], g.pending["attempts"], target)
+            % (
+                context.current_dt,
+                g.pending["signal_date"],
+                g.pending["attempts"],
+                g.pending["target"],
+            )
         )
         g.pending = None
 
@@ -402,16 +595,78 @@ def _pending_from_prior_day(context):
 def _pending_satisfied(context):
     if g.pending is None:
         return True
-    target = g.pending["target"]
+    target_amounts = g.pending.get("target_amounts")
+    if target_amounts is None:
+        return False
     for security, position in context.portfolio.positions.items():
-        if position.total_amount and target.get(security, 0.0) <= 0:
+        current_amount = int(position.total_amount)
+        target_amount = int(target_amounts.get(security, 0))
+        if target_amount == 0 and current_amount:
             return False
-    for security, weight in target.items():
-        if weight > 0 and security not in context.portfolio.positions:
+        if target_amount > 0 and abs(current_amount - target_amount) >= 100:
             return False
-        if weight > 0 and context.portfolio.positions[security].total_amount <= 0:
+    for security, target_amount in target_amounts.items():
+        if target_amount > 0:
+            current_amount = (
+                int(context.portfolio.positions[security].total_amount)
+                if security in context.portfolio.positions
+                else 0
+            )
+            if abs(current_amount - int(target_amount)) >= 100:
+                return False
+    return True
+
+
+def _all_positions_at_target(context, allow_underweight=False):
+    if g.pending is None or g.pending.get("target_amounts") is None:
+        return False
+    target_amounts = g.pending["target_amounts"]
+    for security, position in context.portfolio.positions.items():
+        current_amount = int(position.total_amount)
+        target_amount = int(target_amounts.get(security, 0))
+        if target_amount == 0 and current_amount:
+            return False
+        if target_amount > 0 and current_amount > target_amount + 99:
             return False
     return True
+
+
+def _ensure_target_amounts(context, current_data):
+    if g.pending is None:
+        return False
+    if g.pending.get("target_amounts") is not None:
+        return True
+    total_value = float(context.portfolio.total_value)
+    target_amounts = {security: 0 for security in context.portfolio.positions}
+    for security, weight in sorted(g.pending["target"].items()):
+        current = current_data[security]
+        price = getattr(current, "day_open", None) or getattr(current, "last_price", None)
+        if price is None or price != price or price <= 0:
+            log.info(
+                "S04_BLOCK date=%s side=target security=%s reason=missing_execution_price"
+                % (context.current_dt, security)
+            )
+            return False
+        budget = total_value * float(weight)
+        per_share_cost = float(price) * (1.0 + SLIPPAGE) * (1.0 + COMMISSION)
+        shares = int(max(budget - 5.0, 0.0) / per_share_cost / 100) * 100
+        target_amounts[security] = max(shares, 0)
+    g.pending["target_amounts"] = target_amounts
+    log.info(
+        "S04_TARGET_AMOUNTS date=%s signal_date=%s target=%s target_amounts=%s"
+        % (context.current_dt, g.pending["signal_date"], g.pending["target"], target_amounts)
+    )
+    return True
+
+
+def _affordable_buy_amount(context, security, current_data):
+    current = current_data[security]
+    price = getattr(current, "last_price", None) or getattr(current, "day_open", None)
+    if price is None or price != price or price <= 0:
+        return 0
+    available = max(float(context.portfolio.available_cash) - 5.0, 0.0)
+    per_share_cost = float(price) * (1.0 + SLIPPAGE) * (1.0 + COMMISSION)
+    return int(available / per_share_cost / 100) * 100
 
 
 def _expire_unfilled_signal(context):
@@ -491,13 +746,18 @@ def _update_mature_labels(today):
         success = int(net >= LABEL_MIN_NET_RETURN and mae >= LABEL_MAX_MAE)
         log.info(
             "S04_LABEL signal_date=%s mature_date=%s security=%s selected=%s score=%.8f "
-            "recent_score=%.8f recent_pass=%s gap=%s gross=%.8f net=%.8f mae=%.8f success=%s"
+            "slope=%s r2=%s path_return=%s efficiency_ratio=%s recent_score=%.8f "
+            "recent_pass=%s gap=%s gross=%.8f net=%.8f mae=%.8f success=%s"
             % (
                 label["signal_date"],
                 today,
                 label["security"],
                 label["selected"],
                 label["score"],
+                "%.10f" % label["slope"] if label.get("slope") is not None else "NA",
+                "%.8f" % label["r2"] if label.get("r2") is not None else "NA",
+                "%.10f" % label["path_return"] if label.get("path_return") is not None else "NA",
+                "%.8f" % label["efficiency_ratio"] if label.get("efficiency_ratio") is not None else "NA",
                 label["recent_score"],
                 label["recent_pass"],
                 label["gap"],

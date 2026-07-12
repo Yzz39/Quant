@@ -1,7 +1,11 @@
+import math
+
 import pytest
 
 from scripts.step04_momentum_logic import (
+    efficiency_momentum_score,
     momentum_score,
+    ols_slope_r2_score,
     absolute_momentum_target,
     rank_momentum,
     recent_confirmation_target,
@@ -20,6 +24,49 @@ def test_momentum_score_rejects_short_or_invalid_prices():
         momentum_score([100, 101], lookback=2)
     with pytest.raises(ValueError):
         momentum_score([0, 101, 110], lookback=2)
+
+
+def test_m3a_perfect_exponential_trend_has_r2_one():
+    prices = [100.0 * 1.02**index for index in range(5)]
+    result = ols_slope_r2_score(prices, lookback=4)
+    assert result["beta"] == pytest.approx(math.log(1.02))
+    assert result["r_squared"] == pytest.approx(1.0)
+    assert result["score"] == pytest.approx(math.log(1.02))
+
+
+def test_m3a_uses_lookback_plus_one_prices_and_rejects_nonpositive():
+    with pytest.raises(ValueError):
+        ols_slope_r2_score([100, 101, 102], lookback=3)
+    with pytest.raises(ValueError):
+        ols_slope_r2_score([100, 0, 102, 103], lookback=3)
+    with pytest.raises(ValueError):
+        ols_slope_r2_score([100, float("nan"), 102, 103], lookback=3)
+    with pytest.raises(ValueError):
+        ols_slope_r2_score([100, float("inf"), 102, 103], lookback=3)
+
+
+def test_m3b_monotonic_path_has_efficiency_one():
+    result = efficiency_momentum_score([100, 102, 104, 106, 108], lookback=4)
+    expected_return = math.log(108 / 100)
+    assert result["path_return"] == pytest.approx(expected_return)
+    assert result["efficiency_ratio"] == pytest.approx(1.0)
+    assert result["score"] == pytest.approx(expected_return)
+
+
+def test_m3b_choppy_path_penalizes_the_same_endpoint_return():
+    smooth = efficiency_momentum_score([100, 102, 104, 106, 108], lookback=4)
+    choppy = efficiency_momentum_score([100, 110, 95, 112, 108], lookback=4)
+    assert choppy["path_return"] == pytest.approx(smooth["path_return"])
+    assert 0 < choppy["efficiency_ratio"] < 1
+    assert choppy["score"] < smooth["score"]
+
+
+def test_m3b_preserves_direction_and_handles_flat_path():
+    down = efficiency_momentum_score([108, 106, 104, 102, 100], lookback=4)
+    flat = efficiency_momentum_score([100, 100, 100, 100, 100], lookback=4)
+    assert down["efficiency_ratio"] == pytest.approx(1.0)
+    assert down["score"] < 0
+    assert flat == {"path_return": 0.0, "efficiency_ratio": 0.0, "score": 0.0}
 
 
 def test_rank_momentum_has_deterministic_code_tie_break():

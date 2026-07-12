@@ -1,5 +1,7 @@
 """Pure Python helpers for the Step 04 preregistered baseline."""
 
+import math
+
 
 def momentum_score(closes, lookback=126):
     values = list(closes)
@@ -10,6 +12,58 @@ def momentum_score(closes, lookback=126):
     if start <= 0 or end <= 0:
         raise ValueError("prices must be positive")
     return end / start - 1.0
+
+
+def ols_slope_r2_score(closes, lookback=126):
+    """Return the preregistered M3A log-price OLS slope-quality score."""
+    values = [float(value) for value in closes]
+    if lookback <= 0 or len(values) < lookback + 1:
+        raise ValueError("not enough prices for the requested lookback")
+    values = values[-lookback - 1 :]
+    if any(not math.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("prices must be finite and positive")
+
+    y = [math.log(value) for value in values]
+    n = len(y)
+    x_mean = (n - 1) / 2.0
+    y_mean = sum(y) / n
+    denominator = sum((index - x_mean) ** 2 for index in range(n))
+    beta = sum(
+        (index - x_mean) * (value - y_mean) for index, value in enumerate(y)
+    ) / denominator
+    intercept = y_mean - beta * x_mean
+    ss_res = sum(
+        (value - (intercept + beta * index)) ** 2
+        for index, value in enumerate(y)
+    )
+    ss_tot = sum((value - y_mean) ** 2 for value in y)
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    r_squared = max(0.0, min(1.0, r_squared))
+    return {"beta": beta, "r_squared": r_squared, "score": beta * r_squared}
+
+
+def efficiency_momentum_score(closes, lookback=126):
+    """Return log path return times Kaufman's path-efficiency ratio."""
+    values = [float(value) for value in closes]
+    if lookback <= 0 or len(values) < lookback + 1:
+        raise ValueError("not enough prices for the requested lookback")
+    values = values[-lookback - 1 :]
+    if any(not math.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("prices must be finite and positive")
+
+    log_prices = [math.log(value) for value in values]
+    path_return = log_prices[-1] - log_prices[0]
+    path_length = sum(
+        abs(log_prices[index] - log_prices[index - 1])
+        for index in range(1, len(log_prices))
+    )
+    efficiency_ratio = abs(path_return) / path_length if path_length > 0 else 0.0
+    efficiency_ratio = max(0.0, min(1.0, efficiency_ratio))
+    return {
+        "path_return": path_return,
+        "efficiency_ratio": efficiency_ratio,
+        "score": path_return * efficiency_ratio,
+    }
 
 
 def rank_momentum(scores):

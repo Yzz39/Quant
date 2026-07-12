@@ -162,3 +162,57 @@ def test_invalid_target_weights_are_rejected() -> None:
         engine.submit_signal("2024-01-02", {"A": 0.6, "B": 0.5})
     with pytest.raises(ValueError):
         engine.submit_signal("2024-01-02", {"A": -0.1})
+
+
+def test_partial_buy_keeps_remaining_target_for_retry() -> None:
+    engine = AccountingEngine(initial_cash=100_000, max_retry_days=3)
+    engine.process_day("2024-01-02", {"A": Bar(open=10, close=10)})
+    engine.submit_signal("2024-01-02", {"A": 0.5})
+
+    first = engine.process_day(
+        "2024-01-03", {"A": Bar(open=10, close=10, max_buy_shares=717)}
+    )
+    assert first.positions["A"] == 717
+    assert engine.pending is not None
+
+    second = engine.process_day("2024-01-04", {"A": Bar(open=10, close=10)})
+    assert second.positions["A"] == 4_917
+    assert engine.pending is None
+    assert [order.filled_shares for order in engine.orders if order.side == "buy"] == [717, 4_200]
+
+
+def test_partial_sell_retries_and_clears_odd_lot_residual() -> None:
+    engine = AccountingEngine(initial_cash=100_000, max_retry_days=3)
+    engine.process_day("2024-01-02", {"A": Bar(open=10, close=10)})
+    engine.submit_signal("2024-01-02", {"A": 0.5})
+    engine.process_day("2024-01-03", {"A": Bar(open=10, close=10)})
+    shares = engine.positions["A"]
+
+    engine.submit_signal("2024-01-03", {})
+    engine.process_day("2024-01-04", {"A": Bar(open=10, close=10, max_sell_shares=shares - 22)})
+    assert engine.positions["A"] == 22
+    assert engine.pending is not None
+
+    engine.process_day("2024-01-05", {"A": Bar(open=10, close=10)})
+    assert engine.positions == {}
+    assert engine.pending is None
+    assert engine.orders[-1].side == "sell"
+    assert engine.orders[-1].requested_shares == 22
+
+
+def test_partial_signal_expires_after_three_retry_days_without_duplicate_orders() -> None:
+    engine = AccountingEngine(initial_cash=100_000, max_retry_days=3)
+    engine.process_day("2024-01-02", {"A": Bar(open=10, close=10)})
+    engine.submit_signal("2024-01-02", {"A": 0.5})
+    engine.process_day("2024-01-03", {"A": Bar(open=10, close=10, max_buy_shares=717)})
+    assert engine.pending is not None
+
+    blocked = Bar(open=10, close=10, can_buy=False)
+    engine.process_day("2024-01-04", {"A": blocked})
+    engine.process_day("2024-01-05", {"A": blocked})
+    engine.process_day("2024-01-06", {"A": blocked})
+
+    assert engine.pending is None
+    assert engine.positions["A"] == 717
+    assert engine.orders[-1].status == "canceled"
+    assert engine.orders[-1].reason == "retry_limit"

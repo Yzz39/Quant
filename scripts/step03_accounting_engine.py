@@ -13,6 +13,8 @@ class Bar:
     can_sell: bool = True
     cash_dividend: float = 0.0
     split_ratio: float = 1.0
+    max_buy_shares: int | None = None
+    max_sell_shares: int | None = None
 
 
 @dataclass
@@ -201,6 +203,14 @@ class AccountingEngine:
                 self._record_blocked(pending, date, symbol, "sell", requested, bar, "sell_blocked")
                 continue
 
+            if bar.max_sell_shares is not None:
+                if bar.max_sell_shares < 0:
+                    raise ValueError("max_sell_shares must be non-negative")
+                requested = min(requested, int(bar.max_sell_shares))
+                if requested <= 0:
+                    self._record_blocked(pending, date, symbol, "sell", -amount, bar, "liquidity_limited")
+                    continue
+
             fill_price = float(bar.open) * (1.0 - self.slippage_rate)
             gross = requested * fill_price
             fee = self._commission(gross)
@@ -244,7 +254,18 @@ class AccountingEngine:
 
             fill_price = float(bar.open) * (1.0 + self.slippage_rate)
             affordable = self._affordable_shares(fill_price)
-            fill_shares = min(amount, affordable)
+            tradable_amount = self._round_lot_down(amount)
+            if tradable_amount <= 0:
+                pending.remaining_shares[symbol] = 0
+                self._record_blocked(
+                    pending, date, symbol, "buy", amount, bar, "sub_lot_residual", "skipped"
+                )
+                continue
+            fill_shares = min(tradable_amount, affordable)
+            if bar.max_buy_shares is not None:
+                if bar.max_buy_shares < 0:
+                    raise ValueError("max_buy_shares must be non-negative")
+                fill_shares = min(fill_shares, int(bar.max_buy_shares))
             if fill_shares <= 0:
                 if has_remaining_sell:
                     self._record_blocked(
@@ -282,7 +303,10 @@ class AccountingEngine:
                     reason="" if fill_shares == amount else "cash_limited",
                 )
             )
-            if pending.remaining_shares[symbol] > 0 and not has_remaining_sell:
+            if 0 < pending.remaining_shares[symbol] < self.lot_size:
+                pending.remaining_shares[symbol] = 0
+            elif pending.remaining_shares[symbol] > 0 and not has_remaining_sell and affordable < tradable_amount:
+                # No cash remains for this signal; a retry cannot change that state.
                 pending.remaining_shares[symbol] = 0
 
     def _record_blocked(
