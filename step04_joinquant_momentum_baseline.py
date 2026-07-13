@@ -3,14 +3,16 @@
 # RUN_MODE='m1_absolute'; M2 uses RUN_MODE='m2_recent_confirm';
 # M2R uses RUN_MODE='m2_ranked_recent';
 # M3A uses RUN_MODE='m3_ols_slope'; M3B uses RUN_MODE='m3b_efficiency';
-# M3C uses RUN_MODE='m3c_bias_trend'; M3D uses RUN_MODE='m3d_wls_slope'.
+# M3C uses RUN_MODE='m3c_bias_trend'; M3D uses RUN_MODE='m3d_wls_slope';
+# M3E uses RUN_MODE='m3e_huber_slope';
+# M3F uses RUN_MODE='m3f_equal_rank'.
 from jqdata import *
 import datetime
 import math
 
 
-RUN_MODE = "m2_ranked_recent"
-ENGINE_VERSION = "v0.8"
+RUN_MODE = "m3f_equal_rank"
+ENGINE_VERSION = "v0.10"
 CODE_VERSION = "%s_engine_%s" % (RUN_MODE, ENGINE_VERSION)
 CASH_SECURITY = "511880.XSHG"
 
@@ -23,6 +25,8 @@ SIGNAL_MODES = (
     "m3b_efficiency",
     "m3c_bias_trend",
     "m3d_wls_slope",
+    "m3e_huber_slope",
+    "m3f_equal_rank",
 )
 RECENT_FILTER_MODES = (
     "m2_recent_confirm",
@@ -30,11 +34,17 @@ RECENT_FILTER_MODES = (
     "m3b_efficiency",
     "m3c_bias_trend",
     "m3d_wls_slope",
+    "m3e_huber_slope",
+    "m3f_equal_rank",
 )
 
 CORE = ["510300.XSHG", "511010.XSHG", "518880.XSHG", "511880.XSHG"]
 LOOKBACK = 126
 RECENT_LOOKBACK = 21
+HUBER_EPSILON = 1.345
+HUBER_MAX_ITERATIONS = 50
+HUBER_TOLERANCE = 1e-10
+FUSION_FACTORS = ("huber", "efficiency", "bias")
 ELIGIBILITY_DAYS = 252
 LIQUIDITY_DAYS = 60
 MIN_AVG_MONEY = 50_000_000.0
@@ -95,7 +105,8 @@ def initialize(context):
     )
     log.info(
         "S04_CONFIG mode=%s capital=%.2f lookback=%d recent_lookback=%d label_horizon=%d "
-        "label_min_net=%.4f label_max_mae=%.4f train_start=%s train_end=%s"
+        "label_min_net=%.4f label_max_mae=%.4f huber_epsilon=%.3f huber_max_iter=%d "
+        "train_start=%s train_end=%s"
         % (
             g.mode,
             starting_cash,
@@ -104,6 +115,8 @@ def initialize(context):
             LABEL_HORIZON,
             LABEL_MIN_NET_RETURN,
             LABEL_MAX_MAE,
+            HUBER_EPSILON,
+            HUBER_MAX_ITERATIONS,
             TRAIN_START,
             TRAIN_END,
         )
@@ -149,6 +162,7 @@ def _generate_signal(context, signal_date):
         path_returns,
         efficiency_ratios,
         bias_trend_slopes,
+        factor_metadata,
     ) = _eligible_universe(signal_date)
     if not g.baseline_started:
         if len(eligible) < len(CORE):
@@ -252,7 +266,9 @@ def _generate_signal(context, signal_date):
     if selected is not None:
         log.info(
             "S04_FACTOR_DETAIL date=%s security=%s score=%.8f slope=%s r2=%s "
-            "path_return=%s efficiency_ratio=%s bias_trend_slope=%s"
+            "path_return=%s efficiency_ratio=%s bias_trend_slope=%s huber_iterations=%s "
+            "huber_downweighted=%s huber_score=%s efficiency_score=%s bias_score=%s "
+            "huber_rank=%s efficiency_rank=%s bias_rank=%s"
             % (
                 signal_date,
                 selected,
@@ -262,6 +278,14 @@ def _generate_signal(context, signal_date):
                 "%.10f" % path_returns[selected] if selected in path_returns else "NA",
                 "%.8f" % efficiency_ratios[selected] if selected in efficiency_ratios else "NA",
                 "%.10f" % bias_trend_slopes[selected] if selected in bias_trend_slopes else "NA",
+                factor_metadata.get(selected, {}).get("huber_iterations", "NA"),
+                factor_metadata.get(selected, {}).get("huber_downweighted", "NA"),
+                factor_metadata.get(selected, {}).get("huber_score", "NA"),
+                factor_metadata.get(selected, {}).get("efficiency_score", "NA"),
+                factor_metadata.get(selected, {}).get("bias_score", "NA"),
+                factor_metadata.get(selected, {}).get("huber_rank", "NA"),
+                factor_metadata.get(selected, {}).get("efficiency_rank", "NA"),
+                factor_metadata.get(selected, {}).get("bias_rank", "NA"),
             )
         )
 
@@ -295,6 +319,14 @@ def _generate_signal(context, signal_date):
                 "path_return": path_returns.get(security),
                 "efficiency_ratio": efficiency_ratios.get(security),
                 "bias_trend_slope": bias_trend_slopes.get(security),
+                "huber_iterations": factor_metadata.get(security, {}).get("huber_iterations"),
+                "huber_downweighted": factor_metadata.get(security, {}).get("huber_downweighted"),
+                "huber_score": factor_metadata.get(security, {}).get("huber_score"),
+                "efficiency_score": factor_metadata.get(security, {}).get("efficiency_score"),
+                "bias_score": factor_metadata.get(security, {}).get("bias_score"),
+                "huber_rank": factor_metadata.get(security, {}).get("huber_rank"),
+                "efficiency_rank": factor_metadata.get(security, {}).get("efficiency_rank"),
+                "bias_rank": factor_metadata.get(security, {}).get("bias_rank"),
             }
         )
 
@@ -389,6 +421,7 @@ def _eligible_universe(signal_date):
     path_returns = {}
     efficiency_ratios = {}
     bias_trend_slopes = {}
+    factor_metadata = {}
     reasons = {}
     avg_money = {}
 
@@ -480,6 +513,22 @@ def _eligible_universe(signal_date):
                     % (signal_date, security, reasons[security])
                 )
                 continue
+        elif g.mode == "m3e_huber_slope":
+            try:
+                slope, r2, score, iterations, downweighted = _log_huber_slope_score(
+                    close_values
+                )
+                factor_metadata[security] = {
+                    "huber_iterations": iterations,
+                    "huber_downweighted": downweighted,
+                }
+            except (ValueError, OverflowError) as error:
+                reasons[security] = "huber_error=%s" % error
+                log.info(
+                    "S04_ELIGIBILITY date=%s security=%s eligible=0 reason=%s"
+                    % (signal_date, security, reasons[security])
+                )
+                continue
         elif g.mode == "m3d_wls_slope":
             try:
                 slope, r2, score = _log_wls_slope_score(close_values)
@@ -511,6 +560,30 @@ def _eligible_universe(signal_date):
                     % (signal_date, security, reasons[security])
                 )
                 continue
+        elif g.mode == "m3f_equal_rank":
+            try:
+                slope, r2, huber_score, iterations, downweighted = (
+                    _log_huber_slope_score(close_values)
+                )
+                path_return, efficiency_ratio, efficiency_score = (
+                    _log_efficiency_score(close_values)
+                )
+                bias_trend_slope = _bias_trend_score(close_values)
+                score = 0.0
+                factor_metadata[security] = {
+                    "huber_iterations": iterations,
+                    "huber_downweighted": downweighted,
+                    "huber_score": huber_score,
+                    "efficiency_score": efficiency_score,
+                    "bias_score": bias_trend_slope,
+                }
+            except (ValueError, OverflowError) as error:
+                reasons[security] = "fusion_factor_error=%s" % error
+                log.info(
+                    "S04_ELIGIBILITY date=%s security=%s eligible=0 reason=%s"
+                    % (signal_date, security, reasons[security])
+                )
+                continue
         recent_start_price = close_values[-RECENT_LOOKBACK - 1]
         recent_score = end_price / recent_start_price - 1.0
         eligible.append(security)
@@ -524,22 +597,48 @@ def _eligible_universe(signal_date):
             efficiency_ratios[security] = efficiency_ratio
         if bias_trend_slope is not None:
             bias_trend_slopes[security] = bias_trend_slope
-        if g.signal_count == 0:
+    if g.mode == "m3f_equal_rank" and eligible:
+        component_scores = {
+            factor: {
+                security: factor_metadata[security]["%s_score" % factor]
+                for security in eligible
+            }
+            for factor in FUSION_FACTORS
+        }
+        fused_scores, fusion_ranks = _equal_rank_fusion_scores(component_scores)
+        for security in eligible:
+            scores[security] = fused_scores[security]
+            for factor in FUSION_FACTORS:
+                factor_metadata[security]["%s_rank" % factor] = fusion_ranks[security][factor]
+
+    if g.signal_count == 0:
+        for security in sorted(eligible):
             log.info(
                 "S04_ELIGIBILITY date=%s security=%s eligible=1 query_type=%s avg_money=%.2f "
-                "score=%.8f recent_score=%.8f slope=%s r2=%s path_return=%s efficiency_ratio=%s bias_trend_slope=%s"
+                "score=%.8f recent_score=%.8f slope=%s r2=%s path_return=%s efficiency_ratio=%s "
+                "bias_trend_slope=%s huber_iterations=%s huber_downweighted=%s "
+                "huber_score=%s efficiency_score=%s bias_score=%s huber_rank=%s "
+                "efficiency_rank=%s bias_rank=%s"
                 % (
                     signal_date,
                     security,
-                    query_type,
-                    money,
-                    score,
-                    recent_score,
-                    "%.10f" % slope if slope is not None else "NA",
-                    "%.8f" % r2 if r2 is not None else "NA",
-                    "%.10f" % path_return if path_return is not None else "NA",
-                    "%.8f" % efficiency_ratio if efficiency_ratio is not None else "NA",
-                    "%.10f" % bias_trend_slope if bias_trend_slope is not None else "NA",
+                    metadata[security][0],
+                    avg_money[security],
+                    scores[security],
+                    recent_scores[security],
+                    "%.10f" % slope_scores[security] if security in slope_scores else "NA",
+                    "%.8f" % r2_scores[security] if security in r2_scores else "NA",
+                    "%.10f" % path_returns[security] if security in path_returns else "NA",
+                    "%.8f" % efficiency_ratios[security] if security in efficiency_ratios else "NA",
+                    "%.10f" % bias_trend_slopes[security] if security in bias_trend_slopes else "NA",
+                    factor_metadata.get(security, {}).get("huber_iterations", "NA"),
+                    factor_metadata.get(security, {}).get("huber_downweighted", "NA"),
+                    factor_metadata.get(security, {}).get("huber_score", "NA"),
+                    factor_metadata.get(security, {}).get("efficiency_score", "NA"),
+                    factor_metadata.get(security, {}).get("bias_score", "NA"),
+                    factor_metadata.get(security, {}).get("huber_rank", "NA"),
+                    factor_metadata.get(security, {}).get("efficiency_rank", "NA"),
+                    factor_metadata.get(security, {}).get("bias_rank", "NA"),
                 )
             )
 
@@ -554,7 +653,44 @@ def _eligible_universe(signal_date):
         path_returns,
         efficiency_ratios,
         bias_trend_slopes,
+        factor_metadata,
     )
+
+
+def _equal_rank_fusion_scores(component_scores):
+    """Return centered equal-weight Borda scores and per-factor ranks."""
+    factor_names = sorted(component_scores)
+    if not factor_names:
+        raise ValueError("rank fusion requires at least one factor")
+    securities = sorted(component_scores[factor_names[0]])
+    if not securities:
+        raise ValueError("rank fusion requires at least one security")
+    security_set = set(securities)
+    ranks = {security: {} for security in securities}
+
+    for factor in factor_names:
+        values = component_scores[factor]
+        if set(values) != security_set:
+            raise ValueError("rank fusion factors must cover the same securities")
+        if any(not math.isfinite(float(value)) for value in values.values()):
+            raise ValueError("rank fusion scores must be finite")
+        ranked = sorted(values.items(), key=lambda item: (-item[1], item[0]))
+        for rank, (security, _) in enumerate(ranked, start=1):
+            ranks[security][factor] = rank
+
+    security_count = len(securities)
+    if security_count == 1:
+        return {securities[0]: 0.0}, ranks
+    denominator = float((security_count - 1) * len(factor_names))
+    fused_scores = {
+        security: sum(
+            security_count + 1 - 2 * ranks[security][factor]
+            for factor in factor_names
+        )
+        / denominator
+        for security in securities
+    }
+    return fused_scores, ranks
 
 
 def _log_ols_slope_score(closes):
@@ -620,6 +756,119 @@ def _log_wls_slope_score(closes):
     r2 = 1.0 - residual / total if total > 0 else 0.0
     r2 = max(0.0, min(1.0, r2))
     return slope, r2, slope * r2
+
+
+def _median(values):
+    ordered = sorted(float(value) for value in values)
+    n = len(ordered)
+    if n == 0:
+        raise ValueError("median requires at least one value")
+    middle = n // 2
+    if n % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _weighted_line_fit(y, weights):
+    weight_sum = sum(weights)
+    if weight_sum <= 0:
+        raise ValueError("regression weights must have positive sum")
+    x_mean = sum(weight * index for index, weight in enumerate(weights)) / weight_sum
+    y_mean = sum(weight * value for weight, value in zip(weights, y)) / weight_sum
+    denominator = sum(
+        weight * (index - x_mean) ** 2
+        for index, weight in enumerate(weights)
+    )
+    if denominator <= 0:
+        raise ValueError("regression denominator must be positive")
+    slope = sum(
+        weight * (index - x_mean) * (value - y_mean)
+        for index, (weight, value) in enumerate(zip(weights, y))
+    ) / denominator
+    return y_mean - slope * x_mean, slope
+
+
+def _log_huber_slope_score(
+    closes,
+    epsilon=HUBER_EPSILON,
+    max_iterations=HUBER_MAX_ITERATIONS,
+    tolerance=HUBER_TOLERANCE,
+):
+    """Return Huber IRLS slope, robust weighted R2, score and diagnostics."""
+    values = [float(value) for value in closes]
+    invalid_count = sum(
+        1 for value in values if not math.isfinite(value) or value <= 0
+    )
+    if len(values) < 2 or invalid_count:
+        raise ValueError(
+            "Huber requires at least 2 finite positive closes; n=%s invalid=%s"
+            % (len(values), invalid_count)
+        )
+    if epsilon <= 0 or max_iterations <= 0 or tolerance <= 0:
+        raise ValueError("Huber parameters must be positive")
+
+    y = [math.log(value) for value in values]
+    weights = [1.0] * len(y)
+    intercept, slope = _weighted_line_fit(y, weights)
+    iterations = 0
+    scale_floor = 1e-12
+
+    for iteration in range(1, max_iterations + 1):
+        residuals = [
+            value - (intercept + slope * index)
+            for index, value in enumerate(y)
+        ]
+        residual_median = _median(residuals)
+        mad = _median(abs(residual - residual_median) for residual in residuals)
+        scale = mad / 0.6744897501960817
+        if scale <= scale_floor:
+            break
+        threshold = epsilon * scale
+        weights = [
+            1.0 if abs(residual) <= threshold else threshold / abs(residual)
+            for residual in residuals
+        ]
+        new_intercept, new_slope = _weighted_line_fit(y, weights)
+        iterations = iteration
+        converged = max(
+            abs(new_intercept - intercept), abs(new_slope - slope)
+        ) <= tolerance
+        intercept, slope = new_intercept, new_slope
+        if converged:
+            break
+
+    residuals = [
+        value - (intercept + slope * index)
+        for index, value in enumerate(y)
+    ]
+    residual_median = _median(residuals)
+    mad = _median(abs(residual - residual_median) for residual in residuals)
+    scale = mad / 0.6744897501960817
+    if scale > scale_floor:
+        threshold = epsilon * scale
+        weights = [
+            1.0 if abs(residual) <= threshold else threshold / abs(residual)
+            for residual in residuals
+        ]
+        intercept, slope = _weighted_line_fit(y, weights)
+        residuals = [
+            value - (intercept + slope * index)
+            for index, value in enumerate(y)
+        ]
+
+    weight_sum = sum(weights)
+    y_mean = sum(weight * value for weight, value in zip(weights, y)) / weight_sum
+    residual = sum(
+        weight * error**2 for weight, error in zip(weights, residuals)
+    )
+    total = sum(
+        weight * (value - y_mean) ** 2
+        for weight, value in zip(weights, y)
+    )
+    r2 = 1.0 - residual / total if total > 0 else 0.0
+    r2 = max(0.0, min(1.0, r2))
+    downweighted = sum(1 for weight in weights if weight < 1.0 - 1e-12)
+    return slope, r2, slope * r2, iterations, downweighted
 
 
 def _log_efficiency_score(closes):
@@ -963,8 +1212,11 @@ def _update_mature_labels(today):
             g.selected_net_sum += net
             log.info(
             "S04_LABEL signal_date=%s mature_date=%s security=%s selected=%s selected_rank=%s score=%.8f "
-            "slope=%s r2=%s path_return=%s efficiency_ratio=%s bias_trend_slope=%s recent_score=%.8f "
-            "recent_pass=%s gap=%s gross=%.8f net=%.8f mae=%.8f success=%s"
+            "slope=%s r2=%s path_return=%s efficiency_ratio=%s bias_trend_slope=%s "
+            "huber_iterations=%s huber_downweighted=%s recent_score=%.8f "
+            "huber_score=%s efficiency_score=%s bias_score=%s huber_rank=%s "
+            "efficiency_rank=%s bias_rank=%s recent_pass=%s gap=%s gross=%.8f "
+            "net=%.8f mae=%.8f success=%s"
             % (
                 label["signal_date"],
                 today,
@@ -977,7 +1229,15 @@ def _update_mature_labels(today):
                 "%.10f" % label["path_return"] if label.get("path_return") is not None else "NA",
                 "%.8f" % label["efficiency_ratio"] if label.get("efficiency_ratio") is not None else "NA",
                 "%.10f" % label["bias_trend_slope"] if label.get("bias_trend_slope") is not None else "NA",
+                label.get("huber_iterations", "NA"),
+                label.get("huber_downweighted", "NA"),
                 label["recent_score"],
+                label.get("huber_score", "NA"),
+                label.get("efficiency_score", "NA"),
+                label.get("bias_score", "NA"),
+                label.get("huber_rank", "NA"),
+                label.get("efficiency_rank", "NA"),
+                label.get("bias_rank", "NA"),
                 label["recent_pass"],
                 label["gap"],
                 gross,

@@ -5,9 +5,11 @@ import pytest
 from scripts.step04_momentum_logic import (
     efficiency_momentum_score,
     bias_trend_score,
+    equal_rank_fusion,
     momentum_score,
     ols_slope_r2_score,
     wls_slope_r2_score,
+    huber_slope_r2_score,
     absolute_momentum_target,
     rank_momentum,
     recent_confirmation_target,
@@ -68,6 +70,45 @@ def test_m3d_recent_weights_change_a_non_linear_trend_and_validate_prices():
         wls_slope_r2_score([100.0, 101.0, 0.0, 102.0], lookback=3)
 
 
+def test_m3e_perfect_exponential_trend_matches_ols_without_downweighting():
+    prices = [100.0 * 1.02**index for index in range(9)]
+    result = huber_slope_r2_score(prices, lookback=8)
+    assert result["beta"] == pytest.approx(math.log(1.02))
+    assert result["r_squared"] == pytest.approx(1.0)
+    assert result["score"] == pytest.approx(math.log(1.02))
+    assert result["downweighted"] == 0
+
+
+def test_m3e_is_closer_than_ols_to_the_true_slope_with_one_outlier():
+    true_beta = math.log(1.01)
+    prices = [100.0 * 1.01**index for index in range(21)]
+    prices[-2] *= 1.35
+    ols = ols_slope_r2_score(prices, lookback=20)
+    huber = huber_slope_r2_score(prices, lookback=20)
+    assert abs(huber["beta"] - true_beta) < abs(ols["beta"] - true_beta)
+    assert huber["downweighted"] >= 1
+    assert 0.0 <= huber["r_squared"] <= 1.0
+
+
+def test_m3e_keeps_robust_weights_when_final_mad_reaches_numerical_floor():
+    true_beta = math.log(1.006)
+    prices = [100.0 * 1.006**index for index in range(127)]
+    prices[49] *= 1.25
+    prices[93] *= 0.72
+    result = huber_slope_r2_score(prices)
+    assert result["beta"] == pytest.approx(true_beta, abs=1e-10)
+    assert result["downweighted"] >= 2
+
+
+def test_m3e_validates_prices_and_frozen_parameters():
+    with pytest.raises(ValueError):
+        huber_slope_r2_score([100.0, 101.0, 102.0], lookback=3)
+    with pytest.raises(ValueError):
+        huber_slope_r2_score([100.0, 101.0, 0.0, 102.0], lookback=3)
+    with pytest.raises(ValueError):
+        huber_slope_r2_score([100.0, 101.0, 102.0, 103.0], lookback=3, epsilon=0)
+
+
 def test_m3b_monotonic_path_has_efficiency_one():
     result = efficiency_momentum_score([100, 102, 104, 106, 108], lookback=4)
     expected_return = math.log(108 / 100)
@@ -108,6 +149,43 @@ def test_m3c_uses_latest_25_bias_points_and_rejects_invalid_prices():
         bias_trend_score([100.0] * 126)
     with pytest.raises(ValueError):
         bias_trend_score([100.0] * 126 + [0.0])
+
+
+def test_m3f_equal_rank_fusion_uses_three_equal_votes_not_raw_scales():
+    result = equal_rank_fusion(
+        {
+            "huber": {"A": 3.0, "B": 2.0, "C": 1.0},
+            "efficiency": {"A": 200.0, "B": 300.0, "C": 100.0},
+            "bias": {"A": 0.003, "B": 0.002, "C": 0.001},
+        }
+    )
+    assert result["scores"] == pytest.approx({"A": 2.0 / 3.0, "B": 1.0 / 3.0, "C": -1.0})
+    assert result["ranks"]["A"] == {"bias": 1, "efficiency": 2, "huber": 1}
+    assert sum(result["scores"].values()) == pytest.approx(0.0)
+
+
+def test_m3f_equal_rank_fusion_has_deterministic_ties_and_validates_inputs():
+    tied = equal_rank_fusion({"huber": {"B": 1.0, "A": 1.0}})
+    assert tied["ranks"] == {"A": {"huber": 1}, "B": {"huber": 2}}
+    assert tied["scores"] == {"A": 1.0, "B": -1.0}
+    equal_rank_sums = equal_rank_fusion(
+        {
+            "huber": {"A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0},
+            "efficiency": {"B": 4.0, "C": 3.0, "A": 2.0, "D": 1.0},
+            "bias": {"C": 4.0, "D": 3.0, "A": 2.0, "B": 1.0},
+        }
+    )
+    assert equal_rank_sums["scores"]["A"] == equal_rank_sums["scores"]["B"]
+    assert rank_momentum(equal_rank_sums["scores"])[1:3] == [
+        ("A", equal_rank_sums["scores"]["A"]),
+        ("B", equal_rank_sums["scores"]["B"]),
+    ]
+    with pytest.raises(ValueError):
+        equal_rank_fusion({})
+    with pytest.raises(ValueError):
+        equal_rank_fusion({"huber": {"A": 1.0}, "bias": {"B": 1.0}})
+    with pytest.raises(ValueError):
+        equal_rank_fusion({"huber": {"A": float("nan")}})
 
 
 def test_rank_momentum_has_deterministic_code_tie_break():

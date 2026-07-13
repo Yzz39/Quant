@@ -79,6 +79,115 @@ def wls_slope_r2_score(closes, lookback=126):
     return {"beta": beta, "r_squared": r_squared, "score": beta * r_squared}
 
 
+def _median(values):
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        raise ValueError("median requires at least one value")
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _weighted_line_fit(y, weights):
+    weight_sum = sum(weights)
+    x_mean = sum(weight * index for index, weight in enumerate(weights)) / weight_sum
+    y_mean = sum(weight * value for weight, value in zip(weights, y)) / weight_sum
+    denominator = sum(
+        weight * (index - x_mean) ** 2
+        for index, weight in enumerate(weights)
+    )
+    beta = sum(
+        weight * (index - x_mean) * (value - y_mean)
+        for index, (weight, value) in enumerate(zip(weights, y))
+    ) / denominator
+    return y_mean - beta * x_mean, beta
+
+
+def huber_slope_r2_score(
+    closes,
+    lookback=126,
+    epsilon=1.345,
+    max_iterations=50,
+    tolerance=1e-10,
+):
+    """Return the preregistered M3E Huber IRLS log-price slope score."""
+    values = [float(value) for value in closes]
+    if lookback <= 0 or len(values) < lookback + 1:
+        raise ValueError("not enough prices for the requested lookback")
+    values = values[-lookback - 1 :]
+    if any(not math.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("prices must be finite and positive")
+    if epsilon <= 0 or max_iterations <= 0 or tolerance <= 0:
+        raise ValueError("Huber parameters must be positive")
+
+    y = [math.log(value) for value in values]
+    weights = [1.0] * len(y)
+    intercept, beta = _weighted_line_fit(y, weights)
+    iterations = 0
+    scale_floor = 1e-12
+    for iteration in range(1, max_iterations + 1):
+        residuals = [
+            value - (intercept + beta * index)
+            for index, value in enumerate(y)
+        ]
+        residual_median = _median(residuals)
+        mad = _median(abs(residual - residual_median) for residual in residuals)
+        scale = mad / 0.6744897501960817
+        if scale <= scale_floor:
+            break
+        threshold = epsilon * scale
+        weights = [
+            1.0 if abs(residual) <= threshold else threshold / abs(residual)
+            for residual in residuals
+        ]
+        new_intercept, new_beta = _weighted_line_fit(y, weights)
+        iterations = iteration
+        converged = max(
+            abs(new_intercept - intercept), abs(new_beta - beta)
+        ) <= tolerance
+        intercept, beta = new_intercept, new_beta
+        if converged:
+            break
+
+    residuals = [
+        value - (intercept + beta * index)
+        for index, value in enumerate(y)
+    ]
+    residual_median = _median(residuals)
+    mad = _median(abs(residual - residual_median) for residual in residuals)
+    scale = mad / 0.6744897501960817
+    if scale > scale_floor:
+        threshold = epsilon * scale
+        weights = [
+            1.0 if abs(residual) <= threshold else threshold / abs(residual)
+            for residual in residuals
+        ]
+        intercept, beta = _weighted_line_fit(y, weights)
+        residuals = [
+            value - (intercept + beta * index)
+            for index, value in enumerate(y)
+        ]
+
+    weight_sum = sum(weights)
+    y_mean = sum(weight * value for weight, value in zip(weights, y)) / weight_sum
+    ss_res = sum(weight * error**2 for weight, error in zip(weights, residuals))
+    ss_tot = sum(
+        weight * (value - y_mean) ** 2
+        for weight, value in zip(weights, y)
+    )
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    r_squared = max(0.0, min(1.0, r_squared))
+    downweighted = sum(1 for weight in weights if weight < 1.0 - 1e-12)
+    return {
+        "beta": beta,
+        "r_squared": r_squared,
+        "score": beta * r_squared,
+        "iterations": iterations,
+        "downweighted": downweighted,
+    }
+
+
 def efficiency_momentum_score(closes, lookback=126):
     """Return log path return times Kaufman's path-efficiency ratio."""
     values = [float(value) for value in closes]
@@ -131,6 +240,42 @@ def bias_trend_score(closes, lookback=126, ma_window=90, trend_points=25):
         for index, value in enumerate(normalized)
     ) / denominator
     return {"bias_slope": slope, "score": slope}
+
+
+def equal_rank_fusion(component_scores):
+    """Return M3F centered equal-weight Borda scores and per-factor ranks."""
+    factor_names = sorted(component_scores)
+    if not factor_names:
+        raise ValueError("rank fusion requires at least one factor")
+    securities = sorted(component_scores[factor_names[0]])
+    if not securities:
+        raise ValueError("rank fusion requires at least one security")
+    security_set = set(securities)
+    ranks = {security: {} for security in securities}
+
+    for factor in factor_names:
+        values = component_scores[factor]
+        if set(values) != security_set:
+            raise ValueError("rank fusion factors must cover the same securities")
+        if any(not math.isfinite(float(value)) for value in values.values()):
+            raise ValueError("rank fusion scores must be finite")
+        ranked = sorted(values.items(), key=lambda item: (-item[1], item[0]))
+        for rank, (security, _) in enumerate(ranked, start=1):
+            ranks[security][factor] = rank
+
+    security_count = len(securities)
+    if security_count == 1:
+        return {"scores": {securities[0]: 0.0}, "ranks": ranks}
+    denominator = float((security_count - 1) * len(factor_names))
+    fused_scores = {
+        security: sum(
+            security_count + 1 - 2 * ranks[security][factor]
+            for factor in factor_names
+        )
+        / denominator
+        for security in securities
+    }
+    return {"scores": fused_scores, "ranks": ranks}
 
 
 def rank_momentum(scores):
