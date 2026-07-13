@@ -15,6 +15,7 @@ from scripts.step04_momentum_logic import (
     absolute_momentum_target,
     rank_momentum,
     recent_confirmation_target,
+    ranked_factor_target,
     ranked_recent_target,
     safe_buy_target_value,
     top1_gap,
@@ -35,9 +36,10 @@ def test_joinquant_script_avoids_bare_any_shadowed_by_jqdata_wildcard():
     assert bare_any_calls == []
 
 
-def test_joinquant_script_routes_every_m3_mode_through_ranked_recent_selection():
+def test_joinquant_script_routes_every_m3_mode_through_factor_only_selection():
     script = Path(__file__).resolve().parents[1] / "step04_joinquant_momentum_baseline.py"
-    tree = ast.parse(script.read_text(encoding="utf-8"))
+    source = script.read_text(encoding="utf-8")
+    tree = ast.parse(source)
     assignments = {
         node.targets[0].id: ast.literal_eval(node.value)
         for node in tree.body
@@ -47,7 +49,7 @@ def test_joinquant_script_routes_every_m3_mode_through_ranked_recent_selection()
         and node.targets[0].id in {"RUN_MODE", "ENGINE_VERSION", "M3_MODES"}
     }
     assert assignments["RUN_MODE"] == "m3_ols_slope"
-    assert assignments["ENGINE_VERSION"] == "v0.12"
+    assert assignments["ENGINE_VERSION"] == "v0.13"
     assert set(assignments["M3_MODES"]) == {
         "m3_ols_slope",
         "m3b_efficiency",
@@ -57,6 +59,10 @@ def test_joinquant_script_routes_every_m3_mode_through_ranked_recent_selection()
         "m3f_equal_rank",
         "m3g_efficiency_rank",
     }
+    assert 'RANKED_RECENT_MODES = ("m2_ranked_recent",)' in source
+    assert "RANKED_FACTOR_MODES = M3_MODES" in source
+    assert "elif g.mode in RANKED_FACTOR_MODES:" in source
+    assert "result = _ranked_factor_target(scores, recent_scores)" in source
 
 
 def test_momentum_score_uses_lookback_plus_one_prices():
@@ -367,3 +373,46 @@ def test_m2r_uses_cash_fallback_or_stays_empty_when_no_candidate_passes():
     assert with_cash["decision"] == "cash_ranked"
     assert without_cash["target"] == {}
     assert without_cash["decision"] == "cash_unavailable"
+
+
+def test_m3_factor_only_ignores_negative_recent_momentum_for_top_rank():
+    result = ranked_factor_target(
+        {"A": 0.12, "B": 0.08, "CASH": 0.01},
+        {"A": -0.03, "B": 0.02, "CASH": 0.002},
+        "CASH",
+    )
+    assert result["selected"] == "A"
+    assert result["selected_rank"] == 1
+    assert result["excluded"] == []
+    assert result["absolute_pass"] is True
+    assert result["recent_pass"] is False
+    assert result["decision"] == "ranked_factor_pass"
+    assert result["target"] == {"A": 1.0}
+
+
+def test_m3_factor_only_walks_nonpositive_scores_until_cash_rank():
+    result = ranked_factor_target(
+        {"A": -0.01, "CASH": -0.015, "B": -0.02},
+        {"A": 0.03, "CASH": -0.001, "B": 0.02},
+        "CASH",
+    )
+    assert result["selected"] == "CASH"
+    assert result["selected_rank"] == 2
+    assert result["excluded"] == ["A"]
+    assert result["absolute_pass"] is False
+    assert result["recent_pass"] is False
+    assert result["decision"] == "cash_ranked_factor"
+
+
+def test_m3_factor_only_stays_empty_without_cash_or_positive_score():
+    result = ranked_factor_target(
+        {"A": -0.01, "B": -0.02},
+        {"A": 0.03, "B": 0.02},
+        "CASH",
+    )
+    assert result["selected"] is None
+    assert result["selected_rank"] is None
+    assert result["excluded"] == ["A", "B"]
+    assert result["recent_pass"] is None
+    assert result["decision"] == "cash_unavailable"
+    assert result["target"] == {}

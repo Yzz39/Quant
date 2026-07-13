@@ -454,3 +454,45 @@ def ranked_recent_target(long_scores, recent_scores, cash_security):
         "decision": "cash_unavailable",
         "target": {},
     }
+
+
+def ranked_factor_target(long_scores, recent_scores, cash_security):
+    """Walk a factor ranking while retaining recent momentum only as diagnostics."""
+    ranked = rank_momentum(long_scores)
+    excluded = []
+    for rank, (security, long_score) in enumerate(ranked, start=1):
+        recent_score = recent_scores[security]
+        if security == cash_security:
+            return {
+                "selected": security,
+                "selected_rank": rank,
+                "excluded": excluded,
+                "absolute_pass": long_score > 0.0,
+                "recent_score": recent_score,
+                "recent_pass": recent_score > 0.0,
+                "decision": "cash_ranked_factor",
+                "target": {security: 1.0},
+            }
+        if long_score > 0.0:
+            return {
+                "selected": security,
+                "selected_rank": rank,
+                "excluded": excluded,
+                "absolute_pass": True,
+                "recent_score": recent_score,
+                "recent_pass": recent_score > 0.0,
+                "decision": "ranked_factor_pass",
+                "target": {security: 1.0},
+            }
+        excluded.append(security)
+
+    return {
+        "selected": None,
+        "selected_rank": None,
+        "excluded": excluded,
+        "absolute_pass": False,
+        "recent_score": None,
+        "recent_pass": None,
+        "decision": "cash_unavailable",
+        "target": {},
+    }

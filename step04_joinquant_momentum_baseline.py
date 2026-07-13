@@ -13,9 +13,10 @@ import math
 
 
 RUN_MODE = "m3_ols_slope"
-ENGINE_VERSION = "v0.12"
+ENGINE_VERSION = "v0.13"
 CODE_VERSION = "%s_engine_%s" % (RUN_MODE, ENGINE_VERSION)
 CASH_SECURITY = "511880.XSHG"
+M3_SELECTION_POLICY = "ranked_factor_only"
 
 SIGNAL_MODES = (
     "momentum",
@@ -40,7 +41,8 @@ M3_MODES = (
     "m3g_efficiency_rank",
 )
 RECENT_FILTER_MODES = ("m2_recent_confirm",)
-RANKED_RECENT_MODES = ("m2_ranked_recent",) + M3_MODES
+RANKED_RECENT_MODES = ("m2_ranked_recent",)
+RANKED_FACTOR_MODES = M3_MODES
 
 CORE = ["510300.XSHG", "511010.XSHG", "518880.XSHG", "511880.XSHG"]
 LOOKBACK = 126
@@ -108,11 +110,12 @@ def initialize(context):
         % CODE_VERSION
     )
     log.info(
-        "S04_CONFIG mode=%s capital=%.2f lookback=%d recent_lookback=%d label_horizon=%d "
+        "S04_CONFIG mode=%s selection_policy=%s capital=%.2f lookback=%d recent_lookback=%d label_horizon=%d "
         "label_min_net=%.4f label_max_mae=%.4f huber_epsilon=%.3f huber_max_iter=%d "
         "train_start=%s train_end=%s"
         % (
             g.mode,
+            M3_SELECTION_POLICY if g.mode in M3_MODES else "mode_default",
             starting_cash,
             LOOKBACK,
             RECENT_LOOKBACK,
@@ -183,6 +186,16 @@ def _generate_signal(context, signal_date):
         selected = None
         selected_rank = None
         excluded = []
+    elif g.mode in RANKED_FACTOR_MODES:
+        result = _ranked_factor_target(scores, recent_scores)
+        selected = result["selected"]
+        selected_rank = result["selected_rank"]
+        excluded = result["excluded"]
+        absolute_pass = result["absolute_pass"]
+        recent_score = result["recent_score"]
+        recent_pass = result["recent_pass"]
+        decision = result["decision"]
+        target = result["target"]
     elif g.mode in RANKED_RECENT_MODES:
         result = _ranked_recent_target(scores, recent_scores)
         selected = result["selected"]
@@ -399,6 +412,48 @@ def _ranked_recent_target(long_scores, recent_scores):
         "absolute_pass": False,
         "recent_score": None,
         "recent_pass": False,
+        "decision": "cash_unavailable",
+        "target": {},
+    }
+
+
+def _ranked_factor_target(long_scores, recent_scores):
+    """Walk a factor ranking without using recent momentum as a gate."""
+    ranked = sorted(long_scores.items(), key=lambda item: (-item[1], item[0]))
+    excluded = []
+    for rank, (security, long_score) in enumerate(ranked, start=1):
+        recent_score = recent_scores[security]
+        if security == CASH_SECURITY:
+            return {
+                "selected": security,
+                "selected_rank": rank,
+                "excluded": excluded,
+                "absolute_pass": long_score > 0.0,
+                "recent_score": recent_score,
+                "recent_pass": recent_score > 0.0,
+                "decision": "cash_ranked_factor",
+                "target": {security: 1.0},
+            }
+        if long_score > 0.0:
+            return {
+                "selected": security,
+                "selected_rank": rank,
+                "excluded": excluded,
+                "absolute_pass": True,
+                "recent_score": recent_score,
+                "recent_pass": recent_score > 0.0,
+                "decision": "ranked_factor_pass",
+                "target": {security: 1.0},
+            }
+        excluded.append(security)
+
+    return {
+        "selected": None,
+        "selected_rank": None,
+        "excluded": excluded,
+        "absolute_pass": False,
+        "recent_score": None,
+        "recent_pass": None,
         "decision": "cash_unavailable",
         "target": {},
     }
