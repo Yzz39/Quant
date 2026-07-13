@@ -4,11 +4,14 @@ import pytest
 
 from scripts.step04_momentum_logic import (
     efficiency_momentum_score,
+    bias_trend_score,
     momentum_score,
     ols_slope_r2_score,
+    wls_slope_r2_score,
     absolute_momentum_target,
     rank_momentum,
     recent_confirmation_target,
+    ranked_recent_target,
     safe_buy_target_value,
     top1_gap,
     trend_outcome,
@@ -45,6 +48,26 @@ def test_m3a_uses_lookback_plus_one_prices_and_rejects_nonpositive():
         ols_slope_r2_score([100, float("inf"), 102, 103], lookback=3)
 
 
+def test_m3d_perfect_exponential_trend_has_weighted_r2_one():
+    prices = [100.0 * 1.02**index for index in range(5)]
+    result = wls_slope_r2_score(prices, lookback=4)
+    assert result["beta"] == pytest.approx(math.log(1.02))
+    assert result["r_squared"] == pytest.approx(1.0)
+    assert result["score"] == pytest.approx(math.log(1.02))
+
+
+def test_m3d_recent_weights_change_a_non_linear_trend_and_validate_prices():
+    prices = [100.0, 104.0, 108.0, 106.0, 105.0]
+    ols = ols_slope_r2_score(prices, lookback=4)
+    wls = wls_slope_r2_score(prices, lookback=4)
+    assert wls["beta"] < ols["beta"]
+    assert 0.0 <= wls["r_squared"] <= 1.0
+    with pytest.raises(ValueError):
+        wls_slope_r2_score([100.0, 101.0, 102.0], lookback=3)
+    with pytest.raises(ValueError):
+        wls_slope_r2_score([100.0, 101.0, 0.0, 102.0], lookback=3)
+
+
 def test_m3b_monotonic_path_has_efficiency_one():
     result = efficiency_momentum_score([100, 102, 104, 106, 108], lookback=4)
     expected_return = math.log(108 / 100)
@@ -67,6 +90,24 @@ def test_m3b_preserves_direction_and_handles_flat_path():
     assert down["efficiency_ratio"] == pytest.approx(1.0)
     assert down["score"] < 0
     assert flat == {"path_return": 0.0, "efficiency_ratio": 0.0, "score": 0.0}
+
+
+def test_m3c_rising_bias_has_positive_slope_and_flat_prices_are_flat():
+    rising = [100.0] * 102 + [100.0 + index for index in range(25)]
+    rising_result = bias_trend_score(rising)
+    flat_result = bias_trend_score([100.0] * 127)
+    assert rising_result["bias_slope"] > 0
+    assert rising_result["score"] == rising_result["bias_slope"]
+    assert flat_result["score"] == pytest.approx(0.0)
+
+
+def test_m3c_uses_latest_25_bias_points_and_rejects_invalid_prices():
+    prices = [80.0] * 13 + [100.0] * 114
+    assert bias_trend_score(prices)["score"] == pytest.approx(0.0)
+    with pytest.raises(ValueError):
+        bias_trend_score([100.0] * 126)
+    with pytest.raises(ValueError):
+        bias_trend_score([100.0] * 126 + [0.0])
 
 
 def test_rank_momentum_has_deterministic_code_tie_break():
@@ -146,3 +187,45 @@ def test_m2_holds_cash_when_cash_is_already_top1():
     )
     assert result["decision"] == "cash_top1"
     assert result["target"] == {"CASH": 1.0}
+
+
+def test_m2r_excludes_negative_recent_top1_and_selects_next_rank():
+    result = ranked_recent_target(
+        {"A": 0.12, "B": 0.08, "CASH": 0.01},
+        {"A": -0.03, "B": 0.02, "CASH": 0.002},
+        "CASH",
+    )
+    assert result["selected"] == "B"
+    assert result["selected_rank"] == 2
+    assert result["excluded"] == ["A"]
+    assert result["decision"] == "ranked_recent_pass"
+    assert result["target"] == {"B": 1.0}
+
+
+def test_m2r_continues_past_multiple_failures_until_cash_rank():
+    result = ranked_recent_target(
+        {"A": 0.12, "B": 0.08, "CASH": 0.01, "C": -0.02},
+        {"A": -0.03, "B": -0.01, "CASH": 0.002, "C": 0.04},
+        "CASH",
+    )
+    assert result["selected"] == "CASH"
+    assert result["selected_rank"] == 3
+    assert result["excluded"] == ["A", "B"]
+    assert result["decision"] == "cash_ranked"
+
+
+def test_m2r_uses_cash_fallback_or_stays_empty_when_no_candidate_passes():
+    with_cash = ranked_recent_target(
+        {"A": -0.01, "CASH": -0.02},
+        {"A": 0.03, "CASH": -0.001},
+        "CASH",
+    )
+    without_cash = ranked_recent_target(
+        {"A": -0.01, "B": -0.02},
+        {"A": 0.03, "B": 0.02},
+        "CASH",
+    )
+    assert with_cash["target"] == {"CASH": 1.0}
+    assert with_cash["decision"] == "cash_ranked"
+    assert without_cash["target"] == {}
+    assert without_cash["decision"] == "cash_unavailable"

@@ -42,6 +42,43 @@ def ols_slope_r2_score(closes, lookback=126):
     return {"beta": beta, "r_squared": r_squared, "score": beta * r_squared}
 
 
+def wls_slope_r2_score(closes, lookback=126):
+    """Return the preregistered M3D linearly weighted log-price slope score."""
+    values = [float(value) for value in closes]
+    if lookback <= 0 or len(values) < lookback + 1:
+        raise ValueError("not enough prices for the requested lookback")
+    values = values[-lookback - 1 :]
+    if any(not math.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("prices must be finite and positive")
+
+    y = [math.log(value) for value in values]
+    n = len(y)
+    weights = [1.0 + index / (n - 1) for index in range(n)]
+    weight_sum = sum(weights)
+    x_mean = sum(weight * index for index, weight in enumerate(weights)) / weight_sum
+    y_mean = sum(weight * value for weight, value in zip(weights, y)) / weight_sum
+    denominator = sum(
+        weight * (index - x_mean) ** 2
+        for index, weight in enumerate(weights)
+    )
+    beta = sum(
+        weight * (index - x_mean) * (value - y_mean)
+        for index, (weight, value) in enumerate(zip(weights, y))
+    ) / denominator
+    intercept = y_mean - beta * x_mean
+    ss_res = sum(
+        weight * (value - (intercept + beta * index)) ** 2
+        for index, (weight, value) in enumerate(zip(weights, y))
+    )
+    ss_tot = sum(
+        weight * (value - y_mean) ** 2
+        for weight, value in zip(weights, y)
+    )
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    r_squared = max(0.0, min(1.0, r_squared))
+    return {"beta": beta, "r_squared": r_squared, "score": beta * r_squared}
+
+
 def efficiency_momentum_score(closes, lookback=126):
     """Return log path return times Kaufman's path-efficiency ratio."""
     values = [float(value) for value in closes]
@@ -64,6 +101,36 @@ def efficiency_momentum_score(closes, lookback=126):
         "efficiency_ratio": efficiency_ratio,
         "score": path_return * efficiency_ratio,
     }
+
+
+def bias_trend_score(closes, lookback=126, ma_window=90, trend_points=25):
+    """Return the preregistered M3C normalized price/MA trend slope."""
+    values = [float(value) for value in closes]
+    required = max(lookback + 1, ma_window + trend_points - 1)
+    if lookback <= 0 or ma_window <= 0 or trend_points < 2 or len(values) < required:
+        raise ValueError("not enough prices for the requested bias trend")
+    values = values[-lookback - 1 :]
+    if any(not math.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("prices must be finite and positive")
+
+    bias_values = []
+    first_index = len(values) - trend_points
+    for index in range(first_index, len(values)):
+        ma_start = index - ma_window + 1
+        moving_average = sum(values[ma_start : index + 1]) / ma_window
+        bias_values.append(values[index] / moving_average)
+
+    base_bias = bias_values[0]
+    normalized = [value / base_bias for value in bias_values]
+    n = len(normalized)
+    x_mean = (n - 1) / 2.0
+    y_mean = sum(normalized) / n
+    denominator = sum((index - x_mean) ** 2 for index in range(n))
+    slope = sum(
+        (index - x_mean) * (value - y_mean)
+        for index, value in enumerate(normalized)
+    ) / denominator
+    return {"bias_slope": slope, "score": slope}
 
 
 def rank_momentum(scores):
@@ -173,4 +240,50 @@ def recent_confirmation_target(long_scores, recent_scores, cash_security):
         "recent_pass": recent_pass,
         "decision": decision,
         "target": target,
+    }
+
+
+def ranked_recent_target(long_scores, recent_scores, cash_security):
+    """Apply M2R: exclude negative-recent candidates and continue down the long ranking."""
+    ranked = rank_momentum(long_scores)
+    excluded = []
+    for rank, (security, long_score) in enumerate(ranked, start=1):
+        if security == cash_security:
+            return {
+                "selected": security,
+                "selected_rank": rank,
+                "excluded": excluded,
+                "decision": "cash_ranked",
+                "target": {security: 1.0},
+            }
+        recent_score = recent_scores[security]
+        if long_score > 0.0 and recent_score > 0.0:
+            return {
+                "selected": security,
+                "selected_rank": rank,
+                "excluded": excluded,
+                "decision": "ranked_recent_pass",
+                "target": {security: 1.0},
+            }
+        excluded.append(security)
+
+    if cash_security in long_scores:
+        cash_rank = next(
+            rank
+            for rank, (security, _) in enumerate(ranked, start=1)
+            if security == cash_security
+        )
+        return {
+            "selected": cash_security,
+            "selected_rank": cash_rank,
+            "excluded": excluded,
+            "decision": "cash_fallback",
+            "target": {cash_security: 1.0},
+        }
+    return {
+        "selected": None,
+        "selected_rank": None,
+        "excluded": excluded,
+        "decision": "cash_unavailable",
+        "target": {},
     }

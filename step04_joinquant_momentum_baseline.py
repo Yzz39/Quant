@@ -1,15 +1,36 @@
 # Step 04 M001: the preregistered ETF relative-momentum baseline.
 # Paste this file into JoinQuant. M0 uses RUN_MODE='momentum'; M1 uses
 # RUN_MODE='m1_absolute'; M2 uses RUN_MODE='m2_recent_confirm';
-# M3A uses RUN_MODE='m3_ols_slope'; M3B uses RUN_MODE='m3b_efficiency'.
+# M2R uses RUN_MODE='m2_ranked_recent';
+# M3A uses RUN_MODE='m3_ols_slope'; M3B uses RUN_MODE='m3b_efficiency';
+# M3C uses RUN_MODE='m3c_bias_trend'; M3D uses RUN_MODE='m3d_wls_slope'.
 from jqdata import *
 import datetime
 import math
 
 
-RUN_MODE = "m3b_efficiency"
-CODE_VERSION = "m3b_efficiency_v0.1"
+RUN_MODE = "m2_ranked_recent"
+ENGINE_VERSION = "v0.8"
+CODE_VERSION = "%s_engine_%s" % (RUN_MODE, ENGINE_VERSION)
 CASH_SECURITY = "511880.XSHG"
+
+SIGNAL_MODES = (
+    "momentum",
+    "m1_absolute",
+    "m2_recent_confirm",
+    "m2_ranked_recent",
+    "m3_ols_slope",
+    "m3b_efficiency",
+    "m3c_bias_trend",
+    "m3d_wls_slope",
+)
+RECENT_FILTER_MODES = (
+    "m2_recent_confirm",
+    "m3_ols_slope",
+    "m3b_efficiency",
+    "m3c_bias_trend",
+    "m3d_wls_slope",
+)
 
 CORE = ["510300.XSHG", "511010.XSHG", "518880.XSHG", "511880.XSHG"]
 LOOKBACK = 126
@@ -30,16 +51,9 @@ DATA_FIELDS = ["open", "high", "low", "close", "volume", "money"]
 
 
 def initialize(context):
-    if RUN_MODE not in (
-        "momentum",
-        "m1_absolute",
-        "m2_recent_confirm",
-        "m3_ols_slope",
-        "m3b_efficiency",
-        "equal_weight",
-    ):
+    if RUN_MODE not in SIGNAL_MODES + ("equal_weight",):
         raise ValueError(
-            "RUN_MODE must be momentum, m1_absolute, m2_recent_confirm, m3_ols_slope, m3b_efficiency, or equal_weight"
+            "unsupported RUN_MODE: %s" % RUN_MODE
         )
 
     set_benchmark("000300.XSHG")
@@ -68,6 +82,11 @@ def initialize(context):
     g.last_position_signature = None
     g.config_logged = False
     g.signal_count = 0
+    g.label_total = 0
+    g.label_success = 0
+    g.selected_label_total = 0
+    g.selected_label_success = 0
+    g.selected_net_sum = 0.0
 
     starting_cash = context.portfolio.starting_cash
     log.info(
@@ -129,6 +148,7 @@ def _generate_signal(context, signal_date):
         r2_scores,
         path_returns,
         efficiency_ratios,
+        bias_trend_slopes,
     ) = _eligible_universe(signal_date)
     if not g.baseline_started:
         if len(eligible) < len(CORE):
@@ -143,22 +163,30 @@ def _generate_signal(context, signal_date):
     if not eligible:
         target = {}
         selected = None
-    elif g.mode in (
-        "momentum",
-        "m1_absolute",
-        "m2_recent_confirm",
-        "m3_ols_slope",
-        "m3b_efficiency",
-    ):
+        selected_rank = None
+        excluded = []
+    elif g.mode == "m2_ranked_recent":
+        result = _ranked_recent_target(scores, recent_scores)
+        selected = result["selected"]
+        selected_rank = result["selected_rank"]
+        excluded = result["excluded"]
+        absolute_pass = result["absolute_pass"]
+        recent_score = result["recent_score"]
+        recent_pass = result["recent_pass"]
+        decision = result["decision"]
+        target = result["target"]
+    elif g.mode in SIGNAL_MODES:
         ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
         selected = ranked[0][0]
+        selected_rank = 1
+        excluded = []
         absolute_pass = scores[selected] > 0.0
         recent_score = recent_scores[selected]
         recent_pass = recent_score > 0.0
-        if g.mode in ("m2_recent_confirm", "m3_ols_slope", "m3b_efficiency") and selected == CASH_SECURITY:
+        if g.mode in RECENT_FILTER_MODES and selected == CASH_SECURITY:
             target = {CASH_SECURITY: 1.0}
             decision = "cash_top1"
-        elif g.mode in ("m2_recent_confirm", "m3_ols_slope", "m3b_efficiency") and (not absolute_pass or not recent_pass):
+        elif g.mode in RECENT_FILTER_MODES and (not absolute_pass or not recent_pass):
             if CASH_SECURITY in eligible:
                 target = {CASH_SECURITY: 1.0}
                 decision = "recent_filter" if absolute_pass else "cash_filter"
@@ -177,6 +205,8 @@ def _generate_signal(context, signal_date):
             decision = "top1"
     else:
         selected = None
+        selected_rank = None
+        excluded = []
         absolute_pass = None
         recent_score = None
         recent_pass = None
@@ -201,12 +231,14 @@ def _generate_signal(context, signal_date):
         "%s:%.8f" % (security, target[security]) for security in sorted(target)
     )
     log.info(
-        "S04_SIGNAL date=%s mode=%s selected=%s absolute_pass=%s recent_score=%s recent_pass=%s "
-        "decision=%s eligible=%s scores=%s recent_scores=%s target=%s"
+        "S04_SIGNAL date=%s mode=%s selected=%s selected_rank=%s excluded=%s absolute_pass=%s "
+        "recent_score=%s recent_pass=%s decision=%s eligible=%s scores=%s recent_scores=%s target=%s"
         % (
             signal_date,
             g.mode,
             selected,
+            selected_rank,
+            excluded,
             absolute_pass,
             recent_score,
             recent_pass,
@@ -217,6 +249,21 @@ def _generate_signal(context, signal_date):
             target_text,
         )
     )
+    if selected is not None:
+        log.info(
+            "S04_FACTOR_DETAIL date=%s security=%s score=%.8f slope=%s r2=%s "
+            "path_return=%s efficiency_ratio=%s bias_trend_slope=%s"
+            % (
+                signal_date,
+                selected,
+                scores[selected],
+                "%.10f" % slope_scores[selected] if selected in slope_scores else "NA",
+                "%.8f" % r2_scores[selected] if selected in r2_scores else "NA",
+                "%.10f" % path_returns[selected] if selected in path_returns else "NA",
+                "%.8f" % efficiency_ratios[selected] if selected in efficiency_ratios else "NA",
+                "%.10f" % bias_trend_slopes[selected] if selected in bias_trend_slopes else "NA",
+            )
+        )
 
     gap = 0.0
     ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
@@ -229,13 +276,14 @@ def _generate_signal(context, signal_date):
                 "security": security,
                 "score": scores[security],
                 "selected": int(
-                    g.mode in ("momentum", "m1_absolute", "m2_recent_confirm", "m3_ols_slope", "m3b_efficiency")
+                    g.mode in SIGNAL_MODES
                     and security == selected
                     and target.get(security, 0.0) > 0.0
                 ),
+                "selected_rank": selected_rank if security == selected else None,
                 "gap": (
                     gap
-                    if g.mode in ("momentum", "m1_absolute", "m2_recent_confirm", "m3_ols_slope", "m3b_efficiency")
+                    if g.mode in SIGNAL_MODES
                     and security == selected
                     and target.get(security, 0.0) > 0.0
                     else None
@@ -246,6 +294,7 @@ def _generate_signal(context, signal_date):
                 "r2": r2_scores.get(security),
                 "path_return": path_returns.get(security),
                 "efficiency_ratio": efficiency_ratios.get(security),
+                "bias_trend_slope": bias_trend_slopes.get(security),
             }
         )
 
@@ -258,6 +307,64 @@ def _generate_signal(context, signal_date):
         "target_amounts": None,
         "attempts": 0,
         "last_attempt": None,
+    }
+
+
+def _ranked_recent_target(long_scores, recent_scores):
+    """Select the first positive-long candidate whose 21-day return is positive."""
+    ranked = sorted(long_scores.items(), key=lambda item: (-item[1], item[0]))
+    excluded = []
+    for rank, (security, long_score) in enumerate(ranked, start=1):
+        if security == CASH_SECURITY:
+            return {
+                "selected": security,
+                "selected_rank": rank,
+                "excluded": excluded,
+                "absolute_pass": long_score > 0.0,
+                "recent_score": recent_scores[security],
+                "recent_pass": recent_scores[security] > 0.0,
+                "decision": "cash_ranked",
+                "target": {security: 1.0},
+            }
+        recent_score = recent_scores[security]
+        if long_score > 0.0 and recent_score > 0.0:
+            return {
+                "selected": security,
+                "selected_rank": rank,
+                "excluded": excluded,
+                "absolute_pass": True,
+                "recent_score": recent_score,
+                "recent_pass": True,
+                "decision": "ranked_recent_pass",
+                "target": {security: 1.0},
+            }
+        excluded.append(security)
+
+    if CASH_SECURITY in long_scores:
+        cash_rank = next(
+            rank
+            for rank, (security, _) in enumerate(ranked, start=1)
+            if security == CASH_SECURITY
+        )
+        return {
+            "selected": CASH_SECURITY,
+            "selected_rank": cash_rank,
+            "excluded": excluded,
+            "absolute_pass": long_scores[CASH_SECURITY] > 0.0,
+            "recent_score": recent_scores[CASH_SECURITY],
+            "recent_pass": recent_scores[CASH_SECURITY] > 0.0,
+            "decision": "cash_fallback",
+            "target": {CASH_SECURITY: 1.0},
+        }
+    return {
+        "selected": None,
+        "selected_rank": None,
+        "excluded": excluded,
+        "absolute_pass": False,
+        "recent_score": None,
+        "recent_pass": False,
+        "decision": "cash_unavailable",
+        "target": {},
     }
 
 
@@ -281,6 +388,7 @@ def _eligible_universe(signal_date):
     r2_scores = {}
     path_returns = {}
     efficiency_ratios = {}
+    bias_trend_slopes = {}
     reasons = {}
     avg_money = {}
 
@@ -361,6 +469,7 @@ def _eligible_universe(signal_date):
         r2 = None
         path_return = None
         efficiency_ratio = None
+        bias_trend_slope = None
         if g.mode == "m3_ols_slope":
             try:
                 slope, r2, score = _log_ols_slope_score(close_values)
@@ -371,11 +480,32 @@ def _eligible_universe(signal_date):
                     % (signal_date, security, reasons[security])
                 )
                 continue
+        elif g.mode == "m3d_wls_slope":
+            try:
+                slope, r2, score = _log_wls_slope_score(close_values)
+            except (ValueError, OverflowError) as error:
+                reasons[security] = "wls_error=%s" % error
+                log.info(
+                    "S04_ELIGIBILITY date=%s security=%s eligible=0 reason=%s"
+                    % (signal_date, security, reasons[security])
+                )
+                continue
         elif g.mode == "m3b_efficiency":
             try:
                 path_return, efficiency_ratio, score = _log_efficiency_score(close_values)
             except (ValueError, OverflowError) as error:
                 reasons[security] = "efficiency_error=%s" % error
+                log.info(
+                    "S04_ELIGIBILITY date=%s security=%s eligible=0 reason=%s"
+                    % (signal_date, security, reasons[security])
+                )
+                continue
+        elif g.mode == "m3c_bias_trend":
+            try:
+                bias_trend_slope = _bias_trend_score(close_values)
+                score = bias_trend_slope
+            except (ValueError, OverflowError) as error:
+                reasons[security] = "bias_trend_error=%s" % error
                 log.info(
                     "S04_ELIGIBILITY date=%s security=%s eligible=0 reason=%s"
                     % (signal_date, security, reasons[security])
@@ -392,22 +522,26 @@ def _eligible_universe(signal_date):
         if path_return is not None:
             path_returns[security] = path_return
             efficiency_ratios[security] = efficiency_ratio
-        log.info(
-            "S04_ELIGIBILITY date=%s security=%s eligible=1 query_type=%s avg_money=%.2f "
-            "score=%.8f recent_score=%.8f slope=%s r2=%s path_return=%s efficiency_ratio=%s"
-            % (
-                signal_date,
-                security,
-                query_type,
-                money,
-                score,
-                recent_score,
-                "%.10f" % slope if slope is not None else "NA",
-                "%.8f" % r2 if r2 is not None else "NA",
-                "%.10f" % path_return if path_return is not None else "NA",
-                "%.8f" % efficiency_ratio if efficiency_ratio is not None else "NA",
+        if bias_trend_slope is not None:
+            bias_trend_slopes[security] = bias_trend_slope
+        if g.signal_count == 0:
+            log.info(
+                "S04_ELIGIBILITY date=%s security=%s eligible=1 query_type=%s avg_money=%.2f "
+                "score=%.8f recent_score=%.8f slope=%s r2=%s path_return=%s efficiency_ratio=%s bias_trend_slope=%s"
+                % (
+                    signal_date,
+                    security,
+                    query_type,
+                    money,
+                    score,
+                    recent_score,
+                    "%.10f" % slope if slope is not None else "NA",
+                    "%.8f" % r2 if r2 is not None else "NA",
+                    "%.10f" % path_return if path_return is not None else "NA",
+                    "%.8f" % efficiency_ratio if efficiency_ratio is not None else "NA",
+                    "%.10f" % bias_trend_slope if bias_trend_slope is not None else "NA",
+                )
             )
-        )
 
     return (
         sorted(eligible),
@@ -419,6 +553,7 @@ def _eligible_universe(signal_date):
         r2_scores,
         path_returns,
         efficiency_ratios,
+        bias_trend_slopes,
     )
 
 
@@ -447,6 +582,46 @@ def _log_ols_slope_score(closes):
     return slope, r2, slope * r2
 
 
+def _log_wls_slope_score(closes):
+    """Return log-price WLS slope, weighted R2 and slope*R2."""
+    values = [float(value) for value in closes]
+    invalid_count = sum(
+        1 for value in values if not math.isfinite(value) or value <= 0
+    )
+    if len(values) < 2 or invalid_count:
+        raise ValueError(
+            "WLS requires at least 2 finite positive closes; n=%s invalid=%s"
+            % (len(values), invalid_count)
+        )
+
+    y = [math.log(value) for value in values]
+    n = len(y)
+    weights = [1.0 + index / float(n - 1) for index in range(n)]
+    weight_sum = sum(weights)
+    x_mean = sum(weight * index for index, weight in enumerate(weights)) / weight_sum
+    y_mean = sum(weight * value for weight, value in zip(weights, y)) / weight_sum
+    denominator = sum(
+        weight * (index - x_mean) ** 2
+        for index, weight in enumerate(weights)
+    )
+    slope = sum(
+        weight * (index - x_mean) * (value - y_mean)
+        for index, (weight, value) in enumerate(zip(weights, y))
+    ) / denominator
+    intercept = y_mean - slope * x_mean
+    residual = sum(
+        weight * (value - (intercept + slope * index)) ** 2
+        for index, (weight, value) in enumerate(zip(weights, y))
+    )
+    total = sum(
+        weight * (value - y_mean) ** 2
+        for weight, value in zip(weights, y)
+    )
+    r2 = 1.0 - residual / total if total > 0 else 0.0
+    r2 = max(0.0, min(1.0, r2))
+    return slope, r2, slope * r2
+
+
 def _log_efficiency_score(closes):
     """Return (log path return, efficiency ratio, return*efficiency)."""
     values = [float(value) for value in closes]
@@ -467,6 +642,40 @@ def _log_efficiency_score(closes):
     efficiency_ratio = abs(path_return) / path_length if path_length > 0 else 0.0
     efficiency_ratio = max(0.0, min(1.0, efficiency_ratio))
     return path_return, efficiency_ratio, path_return * efficiency_ratio
+
+
+def _bias_trend_score(closes, ma_window=90, trend_points=25):
+    """Return the OLS slope of normalized price/MA90 over the latest 25 points."""
+    values = [float(value) for value in closes]
+    required = ma_window + trend_points - 1
+    invalid_count = sum(
+        1 for value in values if not math.isfinite(value) or value <= 0
+    )
+    if ma_window <= 0 or trend_points < 2 or len(values) < required or invalid_count:
+        raise ValueError(
+            "bias trend requires %s finite positive closes; n=%s invalid=%s"
+            % (required, len(values), invalid_count)
+        )
+
+    bias_values = []
+    first_index = len(values) - trend_points
+    for index in range(first_index, len(values)):
+        ma_start = index - ma_window + 1
+        moving_average = sum(values[ma_start : index + 1]) / float(ma_window)
+        bias_values.append(values[index] / moving_average)
+
+    base_bias = bias_values[0]
+    if not math.isfinite(base_bias) or base_bias <= 0:
+        raise ValueError("first bias must be finite and positive")
+    normalized = [value / base_bias for value in bias_values]
+    n = len(normalized)
+    x_mean = (n - 1) / 2.0
+    y_mean = sum(normalized) / n
+    denominator = sum((index - x_mean) ** 2 for index in range(n))
+    return sum(
+        (index - x_mean) * (value - y_mean)
+        for index, value in enumerate(normalized)
+    ) / denominator
 
 
 def execute_sells(context):
@@ -719,6 +928,7 @@ def _safe_buy_target_value(context, current_value, desired_value):
 
 def _update_mature_labels(today):
     remaining = []
+    matured_count = 0
     for label in g.labels:
         trade_days = get_trade_days(start_date=label["signal_date"], end_date=today)
         if len(trade_days) < LABEL_HORIZON + 1:
@@ -744,20 +954,29 @@ def _update_mature_labels(today):
         net = gross - ROUND_TRIP_COST
         mae = min(value / start - 1.0 for value in values)
         success = int(net >= LABEL_MIN_NET_RETURN and mae >= LABEL_MAX_MAE)
-        log.info(
-            "S04_LABEL signal_date=%s mature_date=%s security=%s selected=%s score=%.8f "
-            "slope=%s r2=%s path_return=%s efficiency_ratio=%s recent_score=%.8f "
+        matured_count += 1
+        g.label_total += 1
+        g.label_success += success
+        if label["selected"]:
+            g.selected_label_total += 1
+            g.selected_label_success += success
+            g.selected_net_sum += net
+            log.info(
+            "S04_LABEL signal_date=%s mature_date=%s security=%s selected=%s selected_rank=%s score=%.8f "
+            "slope=%s r2=%s path_return=%s efficiency_ratio=%s bias_trend_slope=%s recent_score=%.8f "
             "recent_pass=%s gap=%s gross=%.8f net=%.8f mae=%.8f success=%s"
             % (
                 label["signal_date"],
                 today,
                 label["security"],
                 label["selected"],
+                label.get("selected_rank"),
                 label["score"],
                 "%.10f" % label["slope"] if label.get("slope") is not None else "NA",
                 "%.8f" % label["r2"] if label.get("r2") is not None else "NA",
                 "%.10f" % label["path_return"] if label.get("path_return") is not None else "NA",
                 "%.8f" % label["efficiency_ratio"] if label.get("efficiency_ratio") is not None else "NA",
+                "%.10f" % label["bias_trend_slope"] if label.get("bias_trend_slope") is not None else "NA",
                 label["recent_score"],
                 label["recent_pass"],
                 label["gap"],
@@ -766,8 +985,36 @@ def _update_mature_labels(today):
                 mae,
                 success,
             )
-        )
+            )
     g.labels = remaining
+    if matured_count:
+        selected_precision = (
+            float(g.selected_label_success) / g.selected_label_total
+            if g.selected_label_total
+            else 0.0
+        )
+        unconditional_rate = (
+            float(g.label_success) / g.label_total if g.label_total else 0.0
+        )
+        selected_avg_net = (
+            g.selected_net_sum / g.selected_label_total
+            if g.selected_label_total
+            else 0.0
+        )
+        log.info(
+            "S04_LABEL_SUMMARY date=%s all=%s all_success=%s unconditional_rate=%.8f "
+            "selected=%s selected_success=%s selected_precision=%.8f selected_avg_net=%.8f"
+            % (
+                today,
+                g.label_total,
+                g.label_success,
+                unconditional_rate,
+                g.selected_label_total,
+                g.selected_label_success,
+                selected_precision,
+                selected_avg_net,
+            )
+        )
 
 
 def _is_month_end(today):
