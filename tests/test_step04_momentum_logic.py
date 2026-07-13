@@ -1,4 +1,6 @@
+import ast
 import math
+from pathlib import Path
 
 import pytest
 
@@ -18,6 +20,43 @@ from scripts.step04_momentum_logic import (
     top1_gap,
     trend_outcome,
 )
+
+
+def test_joinquant_script_avoids_bare_any_shadowed_by_jqdata_wildcard():
+    script = Path(__file__).resolve().parents[1] / "step04_joinquant_momentum_baseline.py"
+    tree = ast.parse(script.read_text(encoding="utf-8"))
+    bare_any_calls = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "any"
+    ]
+    assert bare_any_calls == []
+
+
+def test_joinquant_script_routes_every_m3_mode_through_ranked_recent_selection():
+    script = Path(__file__).resolve().parents[1] / "step04_joinquant_momentum_baseline.py"
+    tree = ast.parse(script.read_text(encoding="utf-8"))
+    assignments = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in {"RUN_MODE", "ENGINE_VERSION", "M3_MODES"}
+    }
+    assert assignments["RUN_MODE"] == "m3_ols_slope"
+    assert assignments["ENGINE_VERSION"] == "v0.12"
+    assert set(assignments["M3_MODES"]) == {
+        "m3_ols_slope",
+        "m3b_efficiency",
+        "m3c_bias_trend",
+        "m3d_wls_slope",
+        "m3e_huber_slope",
+        "m3f_equal_rank",
+        "m3g_efficiency_rank",
+    }
 
 
 def test_momentum_score_uses_lookback_plus_one_prices():
@@ -133,6 +172,20 @@ def test_m3b_preserves_direction_and_handles_flat_path():
     assert flat == {"path_return": 0.0, "efficiency_ratio": 0.0, "score": 0.0}
 
 
+def test_m3g_ranks_by_signed_efficiency_momentum_score():
+    paths = {
+        "smooth_up": [100, 102, 104, 106, 108],
+        "choppy_up": [100, 110, 95, 112, 108],
+        "smooth_down": [108, 106, 104, 102, 100],
+    }
+    scores = {
+        security: efficiency_momentum_score(prices, lookback=4)["score"]
+        for security, prices in paths.items()
+    }
+    assert rank_momentum(scores)[0][0] == "smooth_up"
+    assert scores["smooth_down"] < 0
+
+
 def test_m3c_rising_bias_has_positive_slope_and_flat_prices_are_flat():
     rising = [100.0] * 102 + [100.0 + index for index in range(25)]
     rising_result = bias_trend_score(rising)
@@ -149,6 +202,13 @@ def test_m3c_uses_latest_25_bias_points_and_rejects_invalid_prices():
         bias_trend_score([100.0] * 126)
     with pytest.raises(ValueError):
         bias_trend_score([100.0] * 126 + [0.0])
+
+
+def test_m3c_rejects_non_finite_normalized_bias_instead_of_crashing_fusion():
+    prices = [1.0] * 127
+    prices[102] = 1e-310
+    with pytest.raises(ValueError, match="non-finite normalized"):
+        bias_trend_score(prices)
 
 
 def test_m3f_equal_rank_fusion_uses_three_equal_votes_not_raw_scales():

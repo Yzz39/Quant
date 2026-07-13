@@ -3,6 +3,16 @@
 import math
 
 
+def _require_finite_outputs(name, **values):
+    invalid = {
+        key: value
+        for key, value in values.items()
+        if not math.isfinite(float(value))
+    }
+    if invalid:
+        raise ValueError(f"{name} produced non-finite output: {invalid}")
+
+
 def momentum_score(closes, lookback=126):
     values = list(closes)
     if lookback <= 0 or len(values) < lookback + 1:
@@ -179,10 +189,12 @@ def huber_slope_r2_score(
     r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
     r_squared = max(0.0, min(1.0, r_squared))
     downweighted = sum(1 for weight in weights if weight < 1.0 - 1e-12)
+    score = beta * r_squared
+    _require_finite_outputs("Huber", beta=beta, r_squared=r_squared, score=score)
     return {
         "beta": beta,
         "r_squared": r_squared,
-        "score": beta * r_squared,
+        "score": score,
         "iterations": iterations,
         "downweighted": downweighted,
     }
@@ -205,10 +217,17 @@ def efficiency_momentum_score(closes, lookback=126):
     )
     efficiency_ratio = abs(path_return) / path_length if path_length > 0 else 0.0
     efficiency_ratio = max(0.0, min(1.0, efficiency_ratio))
+    score = path_return * efficiency_ratio
+    _require_finite_outputs(
+        "efficiency",
+        path_return=path_return,
+        efficiency_ratio=efficiency_ratio,
+        score=score,
+    )
     return {
         "path_return": path_return,
         "efficiency_ratio": efficiency_ratio,
-        "score": path_return * efficiency_ratio,
+        "score": score,
     }
 
 
@@ -231,6 +250,8 @@ def bias_trend_score(closes, lookback=126, ma_window=90, trend_points=25):
 
     base_bias = bias_values[0]
     normalized = [value / base_bias for value in bias_values]
+    if any(not math.isfinite(value) for value in normalized):
+        raise ValueError("bias trend produced non-finite normalized values")
     n = len(normalized)
     x_mean = (n - 1) / 2.0
     y_mean = sum(normalized) / n
@@ -239,6 +260,7 @@ def bias_trend_score(closes, lookback=126, ma_window=90, trend_points=25):
         (index - x_mean) * (value - y_mean)
         for index, value in enumerate(normalized)
     ) / denominator
+    _require_finite_outputs("bias trend", score=slope)
     return {"bias_slope": slope, "score": slope}
 
 
@@ -389,7 +411,7 @@ def recent_confirmation_target(long_scores, recent_scores, cash_security):
 
 
 def ranked_recent_target(long_scores, recent_scores, cash_security):
-    """Apply M2R: exclude negative-recent candidates and continue down the long ranking."""
+    """Walk a factor ranking until a positive-score, positive-recent candidate passes."""
     ranked = rank_momentum(long_scores)
     excluded = []
     for rank, (security, long_score) in enumerate(ranked, start=1):

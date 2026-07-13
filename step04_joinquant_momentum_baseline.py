@@ -5,14 +5,15 @@
 # M3A uses RUN_MODE='m3_ols_slope'; M3B uses RUN_MODE='m3b_efficiency';
 # M3C uses RUN_MODE='m3c_bias_trend'; M3D uses RUN_MODE='m3d_wls_slope';
 # M3E uses RUN_MODE='m3e_huber_slope';
-# M3F uses RUN_MODE='m3f_equal_rank'.
+# M3F uses RUN_MODE='m3f_equal_rank';
+# M3G uses RUN_MODE='m3g_efficiency_rank'.
 from jqdata import *
 import datetime
 import math
 
 
-RUN_MODE = "m3f_equal_rank"
-ENGINE_VERSION = "v0.10"
+RUN_MODE = "m3_ols_slope"
+ENGINE_VERSION = "v0.12"
 CODE_VERSION = "%s_engine_%s" % (RUN_MODE, ENGINE_VERSION)
 CASH_SECURITY = "511880.XSHG"
 
@@ -27,16 +28,19 @@ SIGNAL_MODES = (
     "m3d_wls_slope",
     "m3e_huber_slope",
     "m3f_equal_rank",
+    "m3g_efficiency_rank",
 )
-RECENT_FILTER_MODES = (
-    "m2_recent_confirm",
+M3_MODES = (
     "m3_ols_slope",
     "m3b_efficiency",
     "m3c_bias_trend",
     "m3d_wls_slope",
     "m3e_huber_slope",
     "m3f_equal_rank",
+    "m3g_efficiency_rank",
 )
+RECENT_FILTER_MODES = ("m2_recent_confirm",)
+RANKED_RECENT_MODES = ("m2_ranked_recent",) + M3_MODES
 
 CORE = ["510300.XSHG", "511010.XSHG", "518880.XSHG", "511880.XSHG"]
 LOOKBACK = 126
@@ -179,7 +183,7 @@ def _generate_signal(context, signal_date):
         selected = None
         selected_rank = None
         excluded = []
-    elif g.mode == "m2_ranked_recent":
+    elif g.mode in RANKED_RECENT_MODES:
         result = _ranked_recent_target(scores, recent_scores)
         selected = result["selected"]
         selected_rank = result["selected_rank"]
@@ -343,7 +347,7 @@ def _generate_signal(context, signal_date):
 
 
 def _ranked_recent_target(long_scores, recent_scores):
-    """Select the first positive-long candidate whose 21-day return is positive."""
+    """Walk a factor ranking until a positive-score, positive-recent candidate passes."""
     ranked = sorted(long_scores.items(), key=lambda item: (-item[1], item[0]))
     excluded = []
     for rank, (security, long_score) in enumerate(ranked, start=1):
@@ -539,7 +543,7 @@ def _eligible_universe(signal_date):
                     % (signal_date, security, reasons[security])
                 )
                 continue
-        elif g.mode == "m3b_efficiency":
+        elif g.mode in ("m3b_efficiency", "m3g_efficiency_rank"):
             try:
                 path_return, efficiency_ratio, score = _log_efficiency_score(close_values)
             except (ValueError, OverflowError) as error:
@@ -672,7 +676,10 @@ def _equal_rank_fusion_scores(component_scores):
         values = component_scores[factor]
         if set(values) != security_set:
             raise ValueError("rank fusion factors must cover the same securities")
-        if any(not math.isfinite(float(value)) for value in values.values()):
+        invalid_count = sum(
+            1 for value in values.values() if not math.isfinite(float(value))
+        )
+        if invalid_count:
             raise ValueError("rank fusion scores must be finite")
         ranked = sorted(values.items(), key=lambda item: (-item[1], item[0]))
         for rank, (security, _) in enumerate(ranked, start=1):
@@ -767,6 +774,16 @@ def _median(values):
     if n % 2:
         return ordered[middle]
     return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _require_finite_outputs(name, **values):
+    invalid = {
+        key: value
+        for key, value in values.items()
+        if not math.isfinite(float(value))
+    }
+    if invalid:
+        raise ValueError("%s produced non-finite output: %s" % (name, invalid))
 
 
 def _weighted_line_fit(y, weights):
@@ -868,7 +885,9 @@ def _log_huber_slope_score(
     r2 = 1.0 - residual / total if total > 0 else 0.0
     r2 = max(0.0, min(1.0, r2))
     downweighted = sum(1 for weight in weights if weight < 1.0 - 1e-12)
-    return slope, r2, slope * r2, iterations, downweighted
+    score = slope * r2
+    _require_finite_outputs("Huber", slope=slope, r2=r2, score=score)
+    return slope, r2, score, iterations, downweighted
 
 
 def _log_efficiency_score(closes):
@@ -890,7 +909,14 @@ def _log_efficiency_score(closes):
     )
     efficiency_ratio = abs(path_return) / path_length if path_length > 0 else 0.0
     efficiency_ratio = max(0.0, min(1.0, efficiency_ratio))
-    return path_return, efficiency_ratio, path_return * efficiency_ratio
+    score = path_return * efficiency_ratio
+    _require_finite_outputs(
+        "efficiency",
+        path_return=path_return,
+        efficiency_ratio=efficiency_ratio,
+        score=score,
+    )
+    return path_return, efficiency_ratio, score
 
 
 def _bias_trend_score(closes, ma_window=90, trend_points=25):
@@ -917,14 +943,19 @@ def _bias_trend_score(closes, ma_window=90, trend_points=25):
     if not math.isfinite(base_bias) or base_bias <= 0:
         raise ValueError("first bias must be finite and positive")
     normalized = [value / base_bias for value in bias_values]
+    invalid_count = sum(1 for value in normalized if not math.isfinite(value))
+    if invalid_count:
+        raise ValueError("bias trend produced non-finite normalized values")
     n = len(normalized)
     x_mean = (n - 1) / 2.0
     y_mean = sum(normalized) / n
     denominator = sum((index - x_mean) ** 2 for index in range(n))
-    return sum(
+    score = sum(
         (index - x_mean) * (value - y_mean)
         for index, value in enumerate(normalized)
     ) / denominator
+    _require_finite_outputs("bias trend", score=score)
+    return score
 
 
 def execute_sells(context):
