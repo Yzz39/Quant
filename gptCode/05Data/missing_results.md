@@ -1,14 +1,32 @@
 # 步骤05缺失结果
 
-截至2026-07-15，已收到180个图像附件，其中174张包含最终绩效，5张仍是回测运行中的画面，另有1张为无效的6×2像素PNG，均不能作为有效结果。
+当前有效最终指标为 194/220，仍缺 26 组。
 
-| 模式 | 窗口 | 调仓间隔 | 状态 |
-|---|---:|---:|---|
-| `momentum` | 126 | 5 | 缺最终截图 |
-| `momentum` | 63 | 5 | 缺最终截图 |
-| `m1_absolute` | 31 | 10 | 缺最终截图 |
-| `m2_recent_confirm` | 63 | 20 | 缺最终截图 |
-| `m3c_bias_trend` | 126 | 5 | 本次截图显示正在回测，缺最终指标 |
-| `m3e_huber_slope` | 126 | 1 | 附件为6×2像素无效PNG，缺最终指标 |
-
-尚未开始的M3B、M3G共40组不计入上表“缺失”，属于后续待运行矩阵。M3D、M3F的20组结果已经全部取得；M3E除126×1外，其余19组已取得最终指标。
+| 模式 | 窗口 | 调仓间隔 | 状态 | 说明 |
+|---|---:|---:|---|---|
+| `m3b_efficiency` | 252 | 20 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 252 | 10 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 252 | 5 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 252 | 1 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 126 | 20 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 126 | 10 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 126 | 5 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 126 | 1 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 63 | 20 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 63 | 10 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 63 | 5 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 63 | 1 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 31 | 20 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 31 | 10 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 31 | 5 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 31 | 1 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 14 | 20 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 14 | 10 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 14 | 5 | `missing_not_run` | 未取得最终截图指标 |
+| `m3b_efficiency` | 14 | 1 | `missing_not_run` | 未取得最终截图指标 |
+| `m3c_bias_trend` | 126 | 1 | `missing_config_mismatch` | 文件名写f1，但图内S05_CODE_VERSION与S05_CONFIG均为f5 |
+| `m3g_efficiency_rank` | 252 | 20 | `not_provided_poor_result` | m3g_efficiency_rank_results.csv |
+| `m3g_efficiency_rank` | 252 | 10 | `not_provided_poor_result` | m3g_efficiency_rank_results.csv |
+| `m3g_efficiency_rank` | 252 | 5 | `not_provided_poor_result` | m3g_efficiency_rank_results.csv |
+| `m3g_efficiency_rank` | 252 | 1 | `not_provided_poor_result` | m3g_efficiency_rank_results.csv |
+| `m3g_efficiency_rank` | 63 | 5 | `not_provided_poor_result` | m3g_efficiency_rank_results.csv |
