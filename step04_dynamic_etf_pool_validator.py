@@ -32,6 +32,21 @@ TEST_START = datetime.date(2015, 1, 1)
 TEST_END = datetime.date(2020, 12, 31)
 
 CASH_SECURITY = "511880.XSHG"
+CORE = (
+    "510300.XSHG",
+    "511010.XSHG",
+    "518880.XSHG",
+    CASH_SECURITY,
+)
+CORE_CASH_EQUIVALENT_SECURITIES = (
+    "159001.XSHE",
+    "159003.XSHE",
+    "159005.XSHE",
+)
+CORE_BOND_SECURITIES = (
+    "511010.XSHG",
+    "511220.XSHG",
+)
 ETF_CATEGORY_ORDER = (
     "broad_equity",
     "cross_border_equity",
@@ -123,7 +138,7 @@ CASH_NAME_KEYWORDS = (
 # 再在元数据层排除LOF和分级产品，可兼容动态池的实际返回口径。
 ETF_QUERY_TYPES = ["etf", "lof"]
 
-ENGINE_VERSION = "pool_validator_category_coverage_v0.8_pearson_spearman"
+ENGINE_VERSION = "pool_validator_category_coverage_v0.9_core_protected_classification_fix"
 
 
 # ============================== 聚宽初始化 ==============================
@@ -175,6 +190,10 @@ def initialize(context):
     log.info(
         "POOL_CATEGORY_CONFIG order=%s min_representatives=%s"
         % (ETF_CATEGORY_ORDER, CATEGORY_MIN_REPRESENTATIVES)
+    )
+    log.info(
+        "POOL_CORE_CONFIG core=%s cash_equivalent=%s bond_overrides=%s"
+        % (CORE, CORE_CASH_EQUIVALENT_SECURITIES, CORE_BOND_SECURITIES)
     )
 
     # 只做盘后诊断，不能产生交易订单。
@@ -241,6 +260,15 @@ def validate_pool(context):
                 diagnostics["metadata_query_warnings"],
                 passed,
                 issues,
+            )
+        )
+        log.info(
+            "POOL_CORE date=%s available=%s selected=%s missing=%s"
+            % (
+                signal_date,
+                diagnostics.get("core_available", []),
+                diagnostics.get("core_selected", []),
+                diagnostics.get("core_missing", []),
             )
         )
         for category in ETF_CATEGORY_ORDER:
@@ -541,8 +569,25 @@ def _build_dynamic_pool(signal_date):
     category_representatives = {}
     pool_limit_count = 0
 
-    # 第一轮只做类别覆盖：每个有合格候选的类别保留流动性最高的一只。
+    # 先锁定原四资产；后续相关性去重只允许淘汰新增候选。
+    core_available = [security for security in CORE if security in liquid]
+    core_risk_available = [security for security in CORE if security in risk_liquid]
+    for security in core_risk_available:
+        if len(risk_pool) >= MAX_DYNAMIC_RISK_POOL_SIZE:
+            pool_limit_count += 1
+            exclusion_reasons[security] = "outside_pool_size_limit"
+            continue
+        risk_pool.append(security)
+        category_representatives.setdefault(
+            category_by_security.get(security),
+            security,
+        )
+
+    # 再为尚未覆盖的类别预留流动性最高的一只；已由核心资产覆盖的类别
+    # 不再强行加入第二只代表，新增标的稍后统一经过相关性过滤。
     for category in RISK_CATEGORY_ORDER:
+        if category in category_representatives:
+            continue
         category_candidates = [
             security for security in risk_liquid
             if category_by_security.get(security) == category
@@ -634,6 +679,11 @@ def _build_dynamic_pool(signal_date):
         "liquid_pass_count": len(liquid),
         "uncapped_risk_count": uncapped_risk_count,
         "risk_pool_count": len(risk_pool),
+        "core_available": core_available,
+        "core_risk_available": core_risk_available,
+        "core_selected": [security for security in CORE if security in pool],
+        "core_missing": [security for security in CORE if security not in pool],
+        "core_unavailable": [security for security in CORE if security not in liquid],
         "exclusion_counts": exclusion_counts,
         "exclusion_samples": exclusion_samples,
         "warmup": listing_cutoff is None,
@@ -701,16 +751,16 @@ def _category_counts(securities, category_by_security):
 
 def _category_aware_liquidity_cap(securities, category_by_security, liquidity):
     """保留每个有合格标的类别的第一名，再用流动性填充全局候选上限。"""
-    if MAX_LIQUID_CANDIDATES < len(RISK_CATEGORY_ORDER):
+    if MAX_LIQUID_CANDIDATES < len(RISK_CATEGORY_ORDER) + len(CORE):
         raise ValueError("MAX_LIQUID_CANDIDATES is smaller than category count")
 
-    reserved = []
+    reserved = [security for security in CORE if security in securities]
     for category in RISK_CATEGORY_ORDER:
         candidates = [
             security for security in securities
             if category_by_security.get(security) == category
         ]
-        if candidates:
+        if candidates and candidates[0] not in reserved:
             reserved.append(candidates[0])
 
     selected = set(reserved)
@@ -733,10 +783,16 @@ def _classify_etf_category(security, metadata):
     upper_name = name.upper()
     upper_security = str(security).upper()
 
-    if security == CASH_SECURITY or _py_any(
-        keyword in name for keyword in CASH_NAME_KEYWORDS
+    if (
+        security == CASH_SECURITY
+        or security in CORE_CASH_EQUIVALENT_SECURITIES
+        or _py_any(
+            keyword in name for keyword in CASH_NAME_KEYWORDS
+        )
     ):
         return "cash"
+    if security in CORE_BOND_SECURITIES:
+        return "bond"
     if security in BROAD_EQUITY_SECURITY_OVERRIDES:
         return "broad_equity"
     if _py_any(
@@ -957,9 +1013,9 @@ def _metadata_exclusion_reason(security, metadata, signal_date, listing_cutoff):
         keyword.upper() in upper_name for keyword in EXCLUDED_NAME_KEYWORDS
     ):
         return "excluded_product_type"
-    if (
-        security != CASH_SECURITY
-        and _py_any(keyword in name for keyword in CASH_NAME_KEYWORDS)
+    if security != CASH_SECURITY and (
+        security in CORE_CASH_EQUIVALENT_SECURITIES
+        or _py_any(keyword in name for keyword in CASH_NAME_KEYWORDS)
     ):
         return "cash_like_duplicate"
 
@@ -1285,6 +1341,10 @@ def _check_pool_invariants(result):
         if security not in category_by_security:
             issues.append("pool_category_missing")
             break
+
+    for security in diagnostics.get("core_risk_available", []):
+        if security not in risk_pool:
+            issues.append("core_missing:%s" % security)
 
     if len(risk_pool) > MAX_DYNAMIC_RISK_POOL_SIZE:
         issues.append("risk_pool_over_max")
